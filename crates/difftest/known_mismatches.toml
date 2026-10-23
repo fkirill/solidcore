@@ -11,6 +11,13 @@
 # case = "gen0042"
 # why = "C++ succeeds with 0 points, Rust returns status_3 (plan/findings.md: ...)"
 
+# PR #668: explicit known differences for this issue.
+
+[[mismatch]]
+unit = "geom.local_solve1d"
+case = "oscillation_failed_last_guess_zeroed_outputs"
+why = "C++ treats the zeroed failed sample as a sign change and returns a false root; Rust requires a successful sample (#481 / WR-253; plan/findings.md: Oscillation bracket search ignores failed samples)"
+
 [[mismatch]]
 unit = "topology.brep_p3"
 case = "nurbs_off_Mouse_0.1"
