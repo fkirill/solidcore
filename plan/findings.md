@@ -18281,7 +18281,8 @@ fixtures and per-unit known records did not change.
 | heal.face_props | 1528 | 1427 | 4 | 97 | 0 |
 
 Total: 37,614 cases, 37,041 matching (including 646 both-error comparisons),
-49 known differences, 508 UNPORTED deferrals, 16 native guard rejections and
+49 known differences, 508 deferrals (471 UNPORTED plus 37 native UB-137 crash guards),
+16 native input-guard rejections and
 zero unexpected failures; five units green and eight partial. The 49 consist of
 47 differences explained above plus two existing main Rust/harness MoveSeam
 limitations in `topology.face_p1`. Those two are not C++ defect claims.

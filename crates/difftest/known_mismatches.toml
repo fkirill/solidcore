@@ -11,7 +11,7 @@
 # case = "gen0042"
 # why = "C++ succeeds with 0 points, Rust returns status_3 (plan/findings.md: ...)"
 
-# #521 / PR #700: failed topology evaluations and incomplete healing stages.
+# PR #700: explicit known differences for this issue.
 
 [[mismatch]]
 unit = "heal.face_props"
