@@ -11,6 +11,243 @@
 # case = "gen0042"
 # why = "C++ succeeds with 0 points, Rust returns status_3 (plan/findings.md: ...)"
 
+# #521 / PR #700: failed topology evaluations and incomplete healing stages.
+
+[[mismatch]]
+unit = "heal.face_props"
+case = "gen0345"
+why = "WR-263 / #521: failed Stage3 retains in-progress marker 5 in C++; Rust retains the same 1040 error but restores incomplete stage 4 for retry; other compared outputs agree (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "heal.face_props"
+case = "gen0821"
+why = "WR-263 / #521: failed Stage3 retains in-progress marker 5 in C++; Rust retains the same 1040 error but restores incomplete stage 4 for retry; other compared outputs agree (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "heal.face_props"
+case = "gen0957"
+why = "WR-263 / #521: failed Stage3 retains in-progress marker 5 in C++; Rust retains the same 1040 error but restores incomplete stage 4 for retry; other compared outputs agree (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "heal.face_props"
+case = "stage3"
+why = "WR-263 / #521: failed Stage3 retains in-progress marker 5 in C++; Rust retains the same 1040 error but restores incomplete stage 4 for retry; other compared outputs agree (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "failed_tangent_constant0_rev0_tangent"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "failed_tangent_constant0_rev0_v1_topological"
+why = "WR-258 / #521: IsTopologicalVertex returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "failed_tangent_constant0_rev1_tangent"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "failed_tangent_constant1_rev0_tangent"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "failed_tangent_constant1_rev0_v1_topological"
+why = "WR-258 / #521: IsTopologicalVertex returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "failed_tangent_constant1_rev1_tangent"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "point_curve_v0_tan1"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "point_curve_v1_tan"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "point_curve_v1_tan1"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "point_curve_v2_tan"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "point_curve_v2_tan1"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "point_curve_v2_topo"
+why = "WR-258 / #521: IsTopologicalVertex returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "point_curve_v3_tan1"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v0_tan-1.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v0_tan0.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v0_tan0.5"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v0_tan1000000.0"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v1_tan-1.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v1_tan0.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v1_tan0.5"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v1_tan1000000.0"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v1_topo"
+why = "WR-258 / #521: IsTopologicalVertex returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v2_tan-1.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v2_tan0.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v2_tan0.5"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v2_tan1000000.0"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v3_tan-1.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v3_tan0.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v3_tan0.5"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale1e-12_v3_tan1000000.0"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v0_tan-1.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v0_tan0.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v0_tan0.5"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v0_tan1000000.0"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v1_tan-1.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v1_tan0.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v1_tan0.5"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v1_tan1000000.0"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v1_topo"
+why = "WR-258 / #521: IsTopologicalVertex returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v3_tan-1.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v3_tan0.0"
+why = "WR-258 / #521: AreEdgesTangent returns FALSE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v3_tan0.5"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
+[[mismatch]]
+unit = "topology.vertex"
+case = "rev_tiny_scale_bsl1e-12_v3_tan1000000.0"
+why = "WR-258 / #521: AreEdgesTangent returns TRUE after an angle calculation with a zero/below-threshold tangent fails; Rust propagates status_1007 (plan/findings.md: Failed topology evaluations and incomplete healing stages)"
+
 [[mismatch]]
 unit = "topology.brep_p3"
 case = "nurbs_off_Mouse_0.1"
