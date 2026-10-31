@@ -8,11 +8,13 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use solidcore::boolean::api_brep::boolean;
+use solidcore::curve::curve::p2::CurveKind;
 use solidcore::geom::a_object::BooleanOperation;
 use solidcore::geom::attribute::{AttributeStore, ObjectKey};
 use solidcore::mass::integrator::properties::{brep_volume, PropertyAttributes};
 use solidcore::math::{Point3, Vec3};
 use solidcore::primitive::api_primitives::create_box;
+use solidcore::surface::surface::p2::SurfaceKind;
 use solidcore::topology::brep::p2::is_manifold_solid;
 use solidcore::topology::brep::validation::{check_brep, CheckLevel};
 use solidcore::topology::proto_topology::p1::api_transform::{
@@ -88,9 +90,28 @@ fn exact_planar_strips_build_valid_solids_with_their_analytic_volumes() {
                         _ => unreachable!(),
                     };
                     let measured = if operation == BooleanOperation::Intersection {
-                        // The mass integrator loses digits on this tiny prism even
-                        // when its vertices agree with the analytic roots. Measure
-                        // the triangular section directly to test Boolean geometry.
+                        // At this scale the mass query and boundary measure differ
+                        // (see the recorded roundoff finding). Verify a plane/line
+                        // prism before measuring its triangular section directly.
+                        assert!(
+                            result
+                                .edges()
+                                .iter()
+                                .all(|(_, edge)| edge.curve.as_ref().is_some_and(
+                                    |curve| matches!(curve.kind(), CurveKind::Line(_))
+                                )),
+                            "{case}"
+                        );
+                        assert!(
+                            result.faces().iter().all(|(_, face)| face
+                                .surface
+                                .as_ref()
+                                .is_some_and(|surface| matches!(
+                                    surface.kind(),
+                                    SurfaceKind::Plane(_)
+                                ))),
+                            "{case}"
+                        );
                         let bottom: Vec<_> = result
                             .vertices()
                             .iter()

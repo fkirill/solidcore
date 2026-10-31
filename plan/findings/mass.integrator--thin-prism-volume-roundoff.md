@@ -1,4 +1,4 @@
-# mass.integrator: tiny planar prism volume loses digits (2026-10-31)
+# mass.integrator: tiny planar prism mass query differs from its boundary volume (2026-10-31)
 
 - **Unit:** `mass.integrator`, `brep_volume`.
 - **PR:** https://github.com/fkirill/solidcore/pull/2
@@ -12,9 +12,11 @@
   8.07999998790584863e-11. The triangular prism's boundary vertices give
   8.079999987923612e-11. The mass query gives 8.07999997737823696e-11
   (about 1.30e-9 relative error). The body passes level-2 validation.
-- **Suspected cause:** cancellation in trimmed planar surface integration;
-  recentering the result alone does not remove the error. This is separate
-  from the Boolean topology failure and its line-root placement error.
+- **Suspected cause:** roundoff in the surface/UV-trim representation or its
+  integration. Recentering the result alone does not remove the difference.
+  The cause has not been isolated to the integrator; correct vertex positions
+  alone do not prove that attribution. The Boolean regression checks its
+  plane/line boundary directly and does not certify the mass query to 1e-9.
 - **Native comparison:** not established for the corrected body; pinned C++
   does not construct this corrected intersection. This is analytic evidence,
   not a confirmed Rust/C++ mismatch or a confirmed upstream defect.
