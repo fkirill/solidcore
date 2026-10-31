@@ -49,6 +49,7 @@ pub mod brep_data_write;
 pub mod database_io;
 pub mod edge;
 pub mod edgeuse;
+pub mod edit;
 pub mod face;
 pub mod geometry_write;
 pub mod integrity;
@@ -62,6 +63,8 @@ pub mod topology_traverser;
 pub mod trimming_tools;
 pub mod vertex;
 pub mod vertexuse;
+
+pub use edit::{edit_brep, EditScope};
 
 use core::marker::PhantomData;
 use std::sync::Arc;
