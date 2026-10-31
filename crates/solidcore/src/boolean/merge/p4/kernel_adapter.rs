@@ -671,6 +671,11 @@ impl<'keys> ManifoldKernelAdapter<'keys> {
         })?
     }
 
+    /// Enable analytic placement only for operands accepted by planar refinement.
+    pub(crate) fn set_refined_planar_crossings(&mut self, enabled: bool) {
+        self.intersector.refined_planar_crossings = enabled;
+    }
+
     /// Set the same explicit intersection tolerances supplied to `SmMerge`.
     /// Leaving them at zero retains the context-only intersector defaults;
     /// automatic tolerance selection belongs to the merge constructor's owner.

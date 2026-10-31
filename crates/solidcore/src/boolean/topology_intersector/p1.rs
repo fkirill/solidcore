@@ -1154,6 +1154,8 @@ impl<O> Default for ExistingSsi<O> {
 pub struct TopologyIntersector<O> {
     /// `m_bSkipSSI`: don't intersect surfaces (default `false`).
     pub skip_ssi: bool,
+    /// Own opt-in placement policy, enabled only after exact planar refinement.
+    pub(crate) refined_planar_crossings: bool,
     /// `m_bSkipManifoldEdges`: don't intersect manifold edges (default `true`).
     pub skip_manifold_edges: bool,
     /// `m_bIntersectTangentEdges` (default `true`).
@@ -1335,6 +1337,7 @@ impl<O: ClassObject + SolutionObject + Ord> TopologyIntersector<O> {
             intersection_table: None,
             subset: None,
             proto_topo_mgr: None,
+            refined_planar_crossings: false,
         }
     }
 
@@ -1998,6 +2001,11 @@ impl<O: ClassObject + SolutionObject + Ord> TopologyIntersector<O> {
             .as_mut()
             .ok_or(dangling("no proto topology manager"))?;
 
+        // WR-614/619: prepare the exact analytic crossings before the first
+        // imprint changes either source edge. Off by default.
+        if self.refined_planar_crossings {
+            mgr.prepare_planar_vertices(k, brep)?;
+        }
         // record the first problem; propagate what cannot be ignored
         let record = |r: Result<()>, ret: &mut Result<()>| -> Result<bool> {
             match r {

@@ -59,6 +59,9 @@
 //! - **Piecewise merge.** [`piecewise_merge`] builds `SmMerge(*pContext, pBrep1,
 //!   pBrep2)` as a merge session of a [`PrimitiveModel`] over both operands and runs its
 //!   `PiecewiseMerge(NULL, FALSE, bCreateNewBrepsForFaces, rpResult)`.
+//! - **Planar strip refinement.** `Kernel::fixes.boolean_refine_planar_strips` may
+//!   reduce entity tolerances of exact plane/line solids before union, intersection
+//!   or difference; geometry and attributes are retained (WR-614/619).
 //! - **Dependencies.** List folding and tree evaluation call `merge::p3`; its
 //!   construction and topology calls retain narrowly scoped dependency errors. The
 //!   two-B-rep entry points build the merge (`boolean.merge_p2`, through
@@ -223,8 +226,8 @@ fn merge_boolean(
 /// B-rep (`SmMerge::m_vEdges`) as it left them.
 fn merge_boolean_by(
     k: &mut Kernel,
-    brep1: Brep,
-    brep2: Brep,
+    mut brep1: Brep,
+    mut brep2: Brep,
     operation: BooleanOperation,
     options: Option<MergeOptions>,
     method: MergeMethod,
@@ -234,10 +237,25 @@ fn merge_boolean_by(
     use crate::boolean::merge::p3::BooleanDriver;
     // (not upstream) the driver carries the operands' attributes through the merge, as
     // upstream's live on the objects the merge edits
+    let refined_planar = if k.fixes.boolean_refine_planar_strips
+        && method == MergeMethod::ByOperands
+        && matches!(
+            operation,
+            BooleanOperation::Union | BooleanOperation::Intersection | BooleanOperation::Difference
+        ) {
+        crate::boolean::planar_precision::refine(k, &mut brep1, &mut brep2)?
+    } else {
+        false
+    };
     let mut driver = crate::boolean::merge::p3::DependencyMerge::carrying_attributes();
     let mut primary = Some(brep1);
     let mut other = Some(brep2);
     driver.construct(k, &mut primary, &mut other, 0.0, 0.0, options.as_ref())?;
+    if let Some(engine) = driver.engine_mut() {
+        engine
+            .intersector
+            .set_refined_planar_crossings(refined_planar);
+    }
     let manifold_solids = match (&primary, &other) {
         (Some(_), Some(_)) if method == MergeMethod::NonManifold => false,
         (Some(a), Some(b)) => is_manifold_solid(a)? && is_manifold_solid(b)?,

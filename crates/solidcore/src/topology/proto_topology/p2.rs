@@ -112,6 +112,11 @@
 //!   (`SM_UNDEF_DOUBLE` components before the first success), and a missing splitting
 //!   edge, which upstream dereferences, is [`SolidError::InvalidInput`].
 //! - **Recursion.** None.
+//! - With `boolean_refine_planar_strips`, edge/face and coplanar edge/edge vertices
+//!   on analytic lines/planes use analytic intersections before imprinting. The
+//!   ordinary point/curve solve can lose meaningful digits of a sub-tolerance
+//!   strip. Other geometry, parallel pairs and roots outside the source edge keep
+//!   their existing placement (WR-614/619; original opt-in precision policy).
 
 use crate::curve::curve::p1::GlobalPointSolveOptions;
 use crate::curve::curve::p2::Curve;
@@ -138,6 +143,7 @@ use crate::topology::brep::p5::{make_edge_in_face_in, EdgeInFace};
 use crate::topology::VertexId;
 
 mod imprint_ends;
+mod planar_crossing;
 
 use super::p1::proto::{are_connected, can_imprint, find_position_from_pcs, topo_dimension};
 use super::p1::{

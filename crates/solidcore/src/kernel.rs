@@ -608,6 +608,13 @@ pub struct UpstreamFixes {
     pub fillet_removal_takes_ring_fillets: bool,
     /// `SmMerge::ManifoldBoolean` refuses a union (`SM_ERR`, the face in the error) when a face its STEP 6 would delete has the infinite region on one side and a solid region on the other: deleting it would merge that solid into the outside. Upstream deletes it: where two operands' faces stay within tolerance of each other across a strip without being coincident (two 4 mm cubes, one turned 5.7 deg about z, within 5e-6 across a 1e-4 strip), the union deletes two such faces of the first operand, both of its solid regions merge into the infinite region, and the union comes back with no solid region and volume 0 (WR-619, #1794; own design, not in the fork).
     pub boolean_union_refuses_solid_leak: bool,
+    /// Refine entity tolerances of geometrically exact plane/line solids before a
+    /// Boolean when nonparallel faces cross within tolerance across a narrow strip
+    /// (WR-614/619, tangency-labs/solidcore#1794). Curved or gapped operands and
+    /// parallel/touching faces retain their declared tolerances. Eligible crossings
+    /// use analytic line/plane and coplanar line/line vertex placement before imprint.
+    /// Off by default.
+    pub boolean_refine_planar_strips: bool,
     /// `SmCurve::SimpleCoincidenceChecker` returns a candidate coincidence range whose curves'
     /// separation points to opposite sides at its two ends (both separations longer than
     /// `SM_EFF_ZERO` scaled by the ends' size) as the one crossing `LocalCurveIntersect`
