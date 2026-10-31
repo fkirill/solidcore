@@ -61,6 +61,31 @@ The planar-strip flag is off in these controls. An independent detached checkout
 of the exact base, its own Cargo target directory, the same pinned fixture tree,
 and the same optimized profile were used. No test expectation was changed.
 
-A local Ubuntu 24.04 x86-64 container with GCC 13, Rust 1.98.0 and the verified
-matching prebuilt C++ reference is being used for final validation. The PR remains
-a draft while that gate is unresolved.
+## x86-64 Linux native result
+
+The same Rust source passes the complete native sweep in Ubuntu 24.04 x86-64,
+with GCC 13.3.0, glibc 2.39, Rust 1.98.0 and verified prebuilt reference
+`v1-3fd5b9548d19-726643fb17a52b7d`: **280 units passed, zero partial, zero failed**.
+All 591,143 baseline cases are retained: 590,442 passed, 18 existing C++ defect
+cases parked, 683 existing guard rejections. These counts equal the original
+baseline exactly. Both ARM comparison failures and all ARM-skipped units pass
+here; no waiver or numerical threshold changed.
+
+The focused strengthened planar-strip regression passes on Linux too. The full
+Rust suite reports 3,410 passed, zero failed, 25 ignored. Formatting, wasm and the
+final whole-report ratchet pass (280 reports, zero regressions). The complete
+runner/FFI suite passes: 1,043 passed, zero failed, 38 ignored, including all
+27,440 isolated geometry/operation/flag probes. Workspace all-target Clippy with
+`difftest/cpp` and `-D warnings` passes. Initial parallel runner and Clippy
+compilations exceeded the container memory limit; both passed with one Cargo job,
+retaining every test and lint. Native execution uses two workers, Cargo at most
+two jobs, and the containers at most four logical CPUs combined / 10 GiB each. The container's local dev
+profile uses opt-level 3 and no debug symbols to share C++ compilation flags with
+the difftest profile; the difftest glue crate remains at opt-level 0 for Clippy,
+with debug assertions and overflow checking enabled. Ubuntu's old sccache reused
+invalid Rust jobserver descriptors, so Rust/Clippy run directly and only C++ uses
+the cache. These are validation-environment changes, not source or gate changes.
+
+The validated Rust source is commit `15a2f68b9fa4c382ccfacf0b83d84a6e3de0dceb`;
+the final subsequent change only records these results. Hosted fork CI remains
+queued for Blacksmith runners; these local results do not bypass its merge gate.
