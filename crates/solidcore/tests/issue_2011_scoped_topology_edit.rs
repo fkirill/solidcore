@@ -9,7 +9,7 @@ use solidcore::geom::context::{MarkType, NotifyCallback};
 use solidcore::geom::object::{NotifyOperation, ObjectRef};
 use solidcore::primitive::api_primitives::create_box;
 use solidcore::topology::brep::{p3, p9};
-use solidcore::topology::topology_traverser::Entity;
+use solidcore::topology::topology_traverser::{Entity, Marks};
 use solidcore::topology::{edit_brep, integrity, Brep, EditScope, FaceId};
 use solidcore::{EntityRef, Kernel, Point3, Result, SolidError};
 
@@ -60,7 +60,7 @@ fn unscoped_delete_leaves_the_cached_topology_stale() {
     let f = b.face_list()[0];
     b.set_editing_enabled(true);
     p3::with_kernel_callbacks(&mut k, &mut b, |k, b, env| {
-        let mut marks = Default::default();
+        let mut marks = Marks::default();
         p3::delete_face(k, b, env, &mut marks, f, p3::DeleteFaceOptions::default())
     })
     .unwrap();
