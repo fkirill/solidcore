@@ -237,19 +237,25 @@ fn merge_boolean_by(
     use crate::boolean::merge::p3::BooleanDriver;
     // (not upstream) the driver carries the operands' attributes through the merge, as
     // upstream's live on the objects the merge edits
-    if k.fixes.boolean_refine_planar_strips
+    let refined_planar = if k.fixes.boolean_refine_planar_strips
         && method == MergeMethod::ByOperands
         && matches!(
             operation,
             BooleanOperation::Union | BooleanOperation::Intersection | BooleanOperation::Difference
-        )
-    {
-        crate::boolean::planar_precision::refine(k, &mut brep1, &mut brep2)?;
-    }
+        ) {
+        crate::boolean::planar_precision::refine(k, &mut brep1, &mut brep2)?
+    } else {
+        false
+    };
     let mut driver = crate::boolean::merge::p3::DependencyMerge::carrying_attributes();
     let mut primary = Some(brep1);
     let mut other = Some(brep2);
     driver.construct(k, &mut primary, &mut other, 0.0, 0.0, options.as_ref())?;
+    if let Some(engine) = driver.engine_mut() {
+        engine
+            .intersector
+            .set_refined_planar_crossings(refined_planar);
+    }
     let manifold_solids = match (&primary, &other) {
         (Some(_), Some(_)) if method == MergeMethod::NonManifold => false,
         (Some(a), Some(b)) => is_manifold_solid(a)? && is_manifold_solid(b)?,

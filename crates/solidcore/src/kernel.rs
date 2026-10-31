@@ -600,7 +600,9 @@ pub struct UpstreamFixes {
     /// Refine entity tolerances of geometrically exact plane/line solids before a
     /// Boolean when nonparallel faces cross within tolerance across a narrow strip
     /// (WR-614/619, tangency-labs/solidcore#1794). Curved or gapped operands and
-    /// parallel/touching faces retain their declared tolerances. Off by default.
+    /// parallel/touching faces retain their declared tolerances. Eligible crossings
+    /// use analytic line/plane and coplanar line/line vertex placement before imprint.
+    /// Off by default.
     pub boolean_refine_planar_strips: bool,
     /// `SmFace::GetPointsInFace` samples a rectangularly trimmed face from its UV domain's
     /// minimum: each column starts at the domain's minimum u plus the column increment and

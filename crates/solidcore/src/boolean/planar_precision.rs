@@ -48,6 +48,19 @@ fn coordinate_scale(b: &Brep) -> Option<f64> {
         }
         scale = scale.max(p.x.abs()).max(p.y.abs()).max(p.z.abs());
     }
+    // A distant plane origin can magnify roundoff in its signed distances even
+    // when the trimmed face itself lies close to the world origin.
+    for (_, face) in b.faces().iter() {
+        if let Some(surface) = face.surface.as_ref() {
+            if let SurfaceKind::Plane(plane) = surface.kind() {
+                let p = plane.position().origin();
+                if !finite(p) {
+                    return None;
+                }
+                scale = scale.max(p.x.abs()).max(p.y.abs()).max(p.z.abs());
+            }
+        }
+    }
     (scale > 0.0).then_some(scale)
 }
 
@@ -83,7 +96,7 @@ fn exact_faces(k: &Kernel, b: &Brep, roundoff: f64) -> Result<Option<Vec<PlanarF
         let (Some(trim), _) = edgeuse::uv_trim_curve(b, id)? else {
             continue;
         };
-        if trim.dim() != 2 || !matches!(trim.kind(), CurveKind::Line(_)) {
+        if trim.dim() != 2 {
             return Ok(None);
         }
         let Some(face) = edgeuse::face(b, id)? else {
@@ -99,8 +112,29 @@ fn exact_faces(k: &Kernel, b: &Brep, roundoff: f64) -> Result<Option<Vec<PlanarF
         let Some(curve) = edge.curve.as_ref() else {
             return Ok(None);
         };
-        for fraction in [0.0, 0.5, 1.0] {
-            let parameter = edge.interval.evaluate(fraction);
+        let mut parameters = vec![
+            edge.interval.min(),
+            edge.interval.mid(),
+            edge.interval.max(),
+        ];
+        match trim.kind() {
+            CurveKind::Line(_) => {}
+            CurveKind::BSpline(spline) if spline.degree()? == 1 && !spline.is_rational()? => {
+                // On a plane, a nonrational degree-one span is affine. Its two
+                // endpoints bound its gap to the affine 3D edge over the span.
+                let (knots, multiplicities) = spline.knots(Some(&edge.interval))?;
+                if knots
+                    .iter()
+                    .zip(&multiplicities)
+                    .any(|(&t, &n)| t > edge.interval.min() && t < edge.interval.max() && n > 1)
+                {
+                    return Ok(None);
+                }
+                parameters.extend(knots);
+            }
+            _ => return Ok(None),
+        }
+        for parameter in parameters {
             let uv = trim.evaluate_point(k, parameter)?;
             let point = surface.evaluate_point(k, Point2::new(uv.x, uv.y))?;
             if !finite(point) || point.distance(curve.evaluate_point(k, parameter)?) > roundoff {
@@ -193,6 +227,9 @@ fn set_precision(b: &mut Brep, tolerance: f64) -> Result<()> {
     let faces: Vec<FaceId> = b.faces().ids().collect();
     for face in faces {
         let tolerance = b.face(face)?.tolerance.min(tolerance);
+        if let Some(surface) = b.face(face)?.surface.as_ref() {
+            surface.delete_trim_cache();
+        }
         face_edit::set_tolerance(b, face, tolerance, false, false)?;
     }
     let edges: Vec<_> = b.edges().ids().collect();
@@ -297,11 +334,73 @@ mod tests {
     }
 
     #[test]
+    fn refinement_preserves_input_vertices_and_attributes() {
+        use crate::error::EntityRef;
+        use crate::geom::attribute::{Attribute, Behavior};
+        let mut k = Kernel::default();
+        let (mut a, mut b) = strip(&mut k);
+        let vertex = a.vertices().ids().next().unwrap();
+        let handle = a
+            .add_attribute(
+                EntityRef::Vertex(vertex),
+                Attribute::new(10001, Behavior::default()),
+            )
+            .unwrap();
+        let vertices: Vec<_> = a.vertices().iter().map(|(id, v)| (id, v.point)).collect();
+        assert!(refine(&k, &mut a, &mut b).unwrap());
+        assert_eq!(
+            a.vertices()
+                .iter()
+                .map(|(id, v)| (id, v.point))
+                .collect::<Vec<_>>(),
+            vertices
+        );
+        assert_eq!(
+            a.entity_attributes(EntityRef::Vertex(vertex))
+                .first()
+                .map(|(h, _)| *h),
+            Some(handle)
+        );
+        assert!(a.tolerance() < 1e-5 && b.tolerance() < 1e-5);
+    }
+
+    #[test]
     fn a_real_vertex_gap_keeps_both_operands_original_tolerances() {
         let mut k = Kernel::default();
         let (mut a, mut b) = strip(&mut k);
         let v = a.vertices().ids().next().unwrap();
         a.vertex_mut(v).unwrap().point.z += 1e-7;
+        let before = (tolerances(&a), tolerances(&b));
+        assert!(!refine(&k, &mut a, &mut b).unwrap());
+        assert_eq!((tolerances(&a), tolerances(&b)), before);
+    }
+
+    #[test]
+    fn a_real_uv_gap_keeps_both_operands_original_tolerances() {
+        use crate::geom::axis2_placement::Axis2Placement;
+        let mut k = Kernel::default();
+        let (mut a, mut b) = strip(&mut k);
+        let eu = a
+            .edgeuses()
+            .ids()
+            .find(|&eu| edgeuse::uv_trim_curve(&a, eu).unwrap().0.is_some())
+            .unwrap();
+        let mut trim = edgeuse::uv_trim_curve(&a, eu).unwrap().0.unwrap().clone();
+        trim.transform(
+            &k,
+            &Axis2Placement::new(Point3::new(1e-7, 0.0, 0.0), Vec3::X, Vec3::Y),
+            None,
+        )
+        .unwrap();
+        edgeuse::set_uv_trim_curve(
+            &mut a,
+            eu,
+            edgeuse::UvTrimCurveArg::New(Box::new(trim)),
+            0.0,
+            false,
+            None,
+        )
+        .unwrap();
         let before = (tolerances(&a), tolerances(&b));
         assert!(!refine(&k, &mut a, &mut b).unwrap());
         assert_eq!((tolerances(&a), tolerances(&b)), before);
