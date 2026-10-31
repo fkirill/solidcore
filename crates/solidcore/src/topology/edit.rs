@@ -13,11 +13,11 @@
 
 use crate::geom::attribute::ObjectKey;
 use crate::kernel::Kernel;
-use crate::topology::brep::p3::with_kernel_callbacks;
+use crate::topology::brep::p3::{topology_ref, with_kernel_callbacks};
 use crate::topology::edge::NotifyEnv;
 use crate::topology::topology_traverser::Marks;
-use crate::topology::Brep;
-use crate::{Result, SolidError};
+use crate::topology::{Brep, BrepId};
+use crate::{EntityRef, Result, SolidError};
 
 /// Notification environment and traversal marks shared by one B-rep edit.
 ///
@@ -67,7 +67,16 @@ impl<'a> EditScope<'a> {
         b: &mut Brep,
         edit: impl FnOnce(&mut Kernel, &mut Brep, &mut Self) -> Result<R>,
     ) -> Result<R> {
-        if b.key() != self.body {
+        // Clones retain the temporary key but have no issued identity. Check
+        // the issuing domain too: key equality alone could lend the source's
+        // attributes and records to another B-rep.
+        let issued_body = self
+            .env
+            .context
+            .as_deref()
+            .and_then(|context| context.issued_brep_serial(b.notify_identity()))
+            .map(|serial| topology_ref(serial, EntityRef::Brep(BrepId::from_index(0))).key);
+        if b.key() != self.body || issued_body != Some(self.body) {
             return Err(SolidError::invalid_input(
                 "topology::edit::EditScope::edit",
                 "nested edit requires the scope's B-rep",

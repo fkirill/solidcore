@@ -217,6 +217,16 @@ fn a_second_context_lend_and_another_body_are_rejected_before_their_closures() {
         });
         assert!(matches!(result, Err(SolidError::InvalidInput { .. })));
         assert!(!ran);
+        // A clone keeps the temporary key but is a distinct body with no issued
+        // notification identity. It must not borrow the source's attribute lists.
+        let mut copy = b.clone();
+        assert_eq!(copy.key(), b.key());
+        let result = scope.edit(k, &mut copy, |_, _, _| {
+            ran = true;
+            Ok(())
+        });
+        assert!(matches!(result, Err(SolidError::InvalidInput { .. })));
+        assert!(!ran);
         assert!(b.editing_enabled());
         let f = b.face_list()[0];
         remove(k, b, scope, f)
