@@ -343,7 +343,7 @@ mod tests {
         let handle = a
             .add_attribute(
                 EntityRef::Vertex(vertex),
-                Attribute::new(10001, Behavior::default()),
+                Attribute::new(10001, Behavior::Copy),
             )
             .unwrap();
         let vertices: Vec<_> = a.vertices().iter().map(|(id, v)| (id, v.point)).collect();
