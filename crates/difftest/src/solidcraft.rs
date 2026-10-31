@@ -1570,6 +1570,7 @@ fn measure(k: &Kernel, b: &mut Brep) -> Result<Measured, SolidError> {
 /// Turns on the `UpstreamFixes` field `name` a case asks for.
 fn enable_fix(k: &mut Kernel, name: &str) -> Result<(), String> {
     let field = match name {
+        "boolean_refine_planar_strips" => &mut k.fixes.boolean_refine_planar_strips,
         "sweep_frame_on_planar_path_normal" => &mut k.fixes.sweep_frame_on_planar_path_normal,
         "imprint_extends_edge_to_proto_vertex" => &mut k.fixes.imprint_extends_edge_to_proto_vertex,
         "imprint_extension_keeps_analytic_curve" => {

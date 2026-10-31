@@ -6,4 +6,5 @@
 
 pub mod api_brep;
 pub mod merge;
+mod planar_precision;
 pub mod topology_intersector;
