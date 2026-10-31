@@ -19,6 +19,11 @@
 //! collection must mark its starting face or return an error, avoiding an infinite
 //! retry on a failed traversal. Owned wire B-reps are released on every return;
 //! a successful consuming union clears the wire handle before the next repetition.
+//! `SweepEdgeHigh` makes a swept face's missing extrusion NURB (a recognised tiny-turn
+//! revolution) before its degenerate test, where upstream's lazy
+//! `GetOrCreateGwNurbPointer` in `EdgeSweepHigher` already made it in place.
+//! Opt-in `translation_sweep_regularize` removes degenerate swept faces and
+//! isolated slit loops after non-merged in-place whole-body translations.
 
 use super::access::{
     EdgeRef, EdgeuseRef, FaceBuild, FaceInput, FaceRef, RegionRef, SweepAccess, VertexRef,
@@ -31,6 +36,7 @@ use crate::geom::attribute::{tag_ids, TagData};
 use crate::geom::tol::ZONE_TOL_3D;
 use crate::math::Point3;
 use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
+use crate::surface::surface::SurfaceKind;
 use crate::topology::{
     edge, edgeuse::p1 as eu, face::p2 as face, loopuse, vertex, vertexuse, LoopuseStart,
 };
@@ -397,7 +403,7 @@ impl TopologySweep {
         a.brep(region.0)?.region(region.1)?;
         let (start, end) = endpoints(a, original)?;
         let swept = g.edge_sweep_higher(a.kernel(region.0)?, a.brep(original.0)?, original.1)?;
-        let Some(surface) = swept.surface else {
+        let Some(mut surface) = swept.surface else {
             self.set_same(Some(e(original)), Some(e(original)));
             self.set_same(Some(v(start)), Some(v(start)));
             self.set_same(Some(v(end)), Some(v(end)));
@@ -405,6 +411,13 @@ impl TopologySweep {
         };
         if swept.trim_curves.is_empty() {
             return Err(SolidError::sm_err(OP));
+        }
+        // `EdgeSweepHigher`'s `CreateNaturalUVTrimCurves` made the NURB of a recognised
+        // extrusion in place (`GetOrCreateGwNurbPointer`); here it is still lazy
+        if let SurfaceKind::SurfOfExtrusion(s) = surface.kind_mut() {
+            if s.base().gw_nurb().is_none() {
+                ignore_status(s.make_nurb(a.kernel(region.0)?))?;
+            }
         }
         if surface.is_degenerate_curve(a.kernel(region.0)?, 1.0e-4, None, ZONE_TOL_3D / 10.0)?
             || surface.is_degenerate_point(a.kernel(region.0)?, ZONE_TOL_3D / 10.0, None)?
@@ -415,7 +428,7 @@ impl TopologySweep {
             ));
         }
         let curve_count = swept.trim_curves.len();
-        let domain = surface.natural_uv_domain();
+        let domain = surface.natural_uv_domain_with_nurb(a.kernel(region.0)?)?;
         let built = a.make_face(FaceInput {
             region,
             loop_counts: vec![curve_count],
@@ -434,10 +447,13 @@ impl TopologySweep {
         // pStrutC is always NULL: its only assignment is in the upstream #if 0.
         self.set_higher(Some(e(original)), Some(f(built.face)));
         let owner = |index: usize| required(built.curve_edges.get(index).copied().flatten());
+        // `s3DCurves.FindElement(curve)`: MakeFaceWithCurves deleted (and nulled the
+        // slot of) a degenerate curve or one coincident with an earlier edge: stale
+        let live = |index: usize| built.curve_edges.get(index).copied().flatten().is_some();
         if let Some(index) = swept.start_curve {
             set_edge_tolerance(a, owner(index)?, swept.start_curve_tol)?;
         }
-        if let Some(index) = swept.far_end_curve.filter(|&i| i < curve_count) {
+        if let Some(index) = swept.far_end_curve.filter(|&i| i < curve_count && live(i)) {
             let new = owner(index)?;
             set_edge_tolerance(a, new, swept.edge_tol)?;
             self.set_same(Some(e(original)), Some(e(new)));
@@ -445,7 +461,10 @@ impl TopologySweep {
         } else {
             self.set_same(Some(e(original)), Some(e(original)));
         }
-        if let Some(index) = swept.start_vert_curve.filter(|&i| i < curve_count) {
+        if let Some(index) = swept
+            .start_vert_curve
+            .filter(|&i| i < curve_count && live(i))
+        {
             let new = owner(index)?;
             set_edge_tolerance(a, new, swept.start_vert_edge_tol)?;
             let (s, t) = endpoints(a, new)?;
@@ -466,7 +485,7 @@ impl TopologySweep {
         } else {
             self.set_same(Some(v(start)), Some(v(start)));
         }
-        if let Some(index) = swept.end_vert_curve.filter(|&i| i < curve_count) {
+        if let Some(index) = swept.end_vert_curve.filter(|&i| i < curve_count && live(i)) {
             let new = owner(index)?;
             set_edge_tolerance(a, new, swept.end_vert_edge_tol)?;
             let (s, t) = endpoints(a, new)?;
@@ -576,7 +595,7 @@ impl TopologySweep {
         }
         let (surface, tolerance) =
             required(g.face_sweep_same(a.kernel(region.0)?, a.brep(original.0)?, original.1)?)?;
-        let domain = surface.natural_uv_domain();
+        let domain = surface.natural_uv_domain_with_nurb(a.kernel(region.0)?)?;
         let built = a.make_face(FaceInput {
             region,
             loop_counts,
@@ -884,6 +903,15 @@ impl TopologySweep {
                     wire_temporaries.retain(|&id| id != wire_brep);
                     wire = WireSweep::Absent;
                 }
+            }
+            if whole
+                && self.repetitions > 0
+                && !self.do_merge
+                && original == destination_brep
+                && matches!(g, SweepGeometry::Translation(_))
+                && a.kernel(original)?.fixes.translation_sweep_regularize
+            {
+                self.regularize_translation(a, original)?;
             }
             Ok(())
         })();
@@ -1222,10 +1250,7 @@ mod tests {
 
     #[derive(Default)]
     struct Access {
-        records: std::collections::BTreeMap<
-            crate::geom::attribute::ObjectKey,
-            crate::topology::topology::Topology,
-        >,
+        records: crate::topology::topology::NotifyRecords,
         attributes: crate::geom::attribute::AttributeStore,
         kernel: Kernel,
         breps: Vec<Brep>,

@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "sc_edgeuse_graph.h"
+#include "sc_trim_curve_record.h"
 
 namespace
 {
@@ -39,9 +40,15 @@ enum Op3 : int32_t
     OP_BINORMAL = 2,
     OP_NORMALIZED = 3,
     OP_GET_OR_CREATE = 4,
+    OP_EXPORT_GAPS = 5,
 };
 
 const double ST_NULL_DEREF = -2.0;
+
+struct GapPeek : SmEdgeuse
+{
+    static SmEdgeFaceGap SmEdgeuse::*cached() { return &GapPeek::m_sMaxEdgeFaceGap3d; }
+};
 
 // GetMate/GetRadial/GetUVTrimCurve need the edge's primary edgeuse (loop edgeuses).
 bool has_prim(SmEdgeuse* p)
@@ -76,6 +83,56 @@ void put_edge_state(std::vector<double>& o, SmEdgeuse* p)
     o.push_back((double)e->GetTolerance());
 }
 
+// The tail every op reports: the edge use's and its mate's state, the edge state
+// (`put_eu_state` carries each edge use's full UV trim curve record).
+void put_states(std::vector<double>& o, Graph& g, SmEdgeuse* p, SmEdgeuse* mate)
+{
+    put_eu_state(o, g, p);
+    put_eu_state(o, g, mate);
+    put_edge_state(o, p);
+}
+
+// Evaluate the newly returned curve without attaching it or changing topology.
+void put_created_lift(std::vector<double>& o, SmEdgeuse* p, SmBSplineCurve* trim)
+{
+    if (trim == nullptr)
+    {
+        o.push_back(0.0);
+        return;
+    }
+    SmEdge* edge = p->GetEdge();
+    SmFace* face = p->GetFace();
+    SmCurve* curve = edge ? edge->GetCurve() : nullptr;
+    SmSurface* surface = face ? face->GetSurface() : nullptr;
+    if (curve == nullptr || surface == nullptr)
+    {
+        o.push_back(ST_NULL_DEREF);
+        return;
+    }
+    o.push_back(5.0);
+    o.push_back((double)curve->GetType());
+    const SmExtent1d interval = edge->GetInterval();
+    for (int i = 0; i <= 4; ++i)
+    {
+        const double t = interval.Evaluate(i / 4.0);
+        SmPoint3d xyz, uv, lifted;
+        SmStatus status = curve->EvaluatePoint(t, xyz);
+        if (status == SM_SUCCESS)
+            status = trim->EvaluatePoint(t, uv);
+        if (status == SM_SUCCESS)
+            status = surface->EvaluatePoint(SmPoint2d(uv.x, uv.y), lifted);
+        o.push_back(st(status));
+        if (status == SM_SUCCESS)
+        {
+            o.push_back(t);
+            put_vec(o, xyz);
+            o.push_back(uv.x);
+            o.push_back(uv.y);
+            put_vec(o, lifted);
+        }
+    }
+}
+
 int32_t run_op(int32_t op, Rd& rd, const char* path, std::vector<double>& o)
 {
     SmStatus bst;
@@ -90,6 +147,20 @@ int32_t run_op(int32_t op, Rd& rd, const char* path, std::vector<double>& o)
     o.push_back(0.0);
     Graph g;
     walk(b.brep, g);
+    if (op == OP_EXPORT_GAPS)
+    {
+        o.push_back((double)g.edgeuses.size());
+        for (SmEdgeuse* eu : g.edgeuses)
+        {
+            const SmEdgeFaceGap& gap = eu->*GapPeek::cached();
+            o.push_back((double)g.find(6, gap.GetEdgeuse()));
+            o.push_back(gap.GetLength());
+            o.push_back(gap.GetEdgeT());
+            o.push_back(gap.GetFaceUV().x);
+            o.push_back(gap.GetFaceUV().y);
+        }
+        return SC_OK;
+    }
     const int64_t selected = rd.idx();
     // A file fixture can change after the validating export. Refuse a stale
     // selector instead of indexing beyond the freshly rebuilt graph. Ordinary
@@ -103,6 +174,7 @@ int32_t run_op(int32_t op, Rd& rd, const char* path, std::vector<double>& o)
     {
         SmBoolean want_dev = rd.bflag();
         bool has_fail = rd.flag();
+        bool sample_lift = rd.flag();
         // CreateUVTrimCurve starts with GetBrep() and NER(GetFaceuse()); a wire edgeuse
         // returns SM_ERR_NULL_POINTER before anything else is touched.
         if (p->GetFaceuse() == nullptr)
@@ -127,12 +199,12 @@ int32_t run_op(int32_t op, Rd& rd, const char* path, std::vector<double>& o)
         o.push_back(st(s));
         o.push_back(c ? dist : -1.0);
         o.push_back(want_dev && c ? dev : -1.0);
-        put_curve_id(o, c);
+        sc_trim_curve::put_trim_curve(o, c);
+        if (sample_lift)
+            put_created_lift(o, p, c);
         o.push_back(has_fail ? (double)fail.m_eCreatePathType : -1.0);
         o.push_back(has_fail && fail.m_pBrep ? 1.0 : 0.0);
-        put_eu_state(o, g, p);
-        put_eu_state(o, g, mate);
-        put_edge_state(o, p);
+        put_states(o, g, p, mate);
         if (c)
         {
             c->SetOwner(NULL);
@@ -164,17 +236,12 @@ int32_t run_op(int32_t op, Rd& rd, const char* path, std::vector<double>& o)
         SmEdgeuse* mate = p->GetMate();
         SmCurve* uv = nullptr;
         double dist = 0.0, dev = 0.0;
-        // An existing curve reports the cached maximum edge/face gap, whose length the graph
-        // export does not carry (only whether it is set): not compared (plan/findings.md).
-        bool gap_hidden = want_dist && p->GetUVTrimCurve() != nullptr && p->IsMaxEdgeFaceGapInit();
         SmStatus s = p->GetOrCreateUVTrimCurve(uv, want_dist ? &dist : NULL, want_dev ? &dev : NULL, ok_make);
         o.push_back(st(s));
-        o.push_back(want_dist && !gap_hidden ? dist : -2.0);
+        o.push_back(want_dist ? dist : -2.0);
         o.push_back(want_dev ? dev : -2.0);
         o.push_back(uv ? 1.0 : 0.0);
-        put_eu_state(o, g, p);
-        put_eu_state(o, g, mate);
-        put_edge_state(o, p);
+        put_states(o, g, p, mate);
         break;
     }
     case OP_BINORMAL:
@@ -210,9 +277,7 @@ int32_t run_op(int32_t op, Rd& rd, const char* path, std::vector<double>& o)
             o.push_back(uvvec.x);
             o.push_back(uvvec.y);
         }
-        put_eu_state(o, g, p);
-        put_eu_state(o, g, mate);
-        put_edge_state(o, p);
+        put_states(o, g, p, mate);
         break;
     }
     case OP_NORMALIZED:
@@ -253,9 +318,7 @@ int32_t run_op(int32_t op, Rd& rd, const char* path, std::vector<double>& o)
             put_vec(o, pnt);
             put_vec(o, d1);
         }
-        put_eu_state(o, g, p);
-        put_eu_state(o, g, mate);
-        put_edge_state(o, p);
+        put_states(o, g, p, mate);
         break;
     }
     default:

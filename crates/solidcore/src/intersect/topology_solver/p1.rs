@@ -100,10 +100,13 @@ use crate::geom::vector3d::sqrt;
 use crate::intersect::point_class::PointClassification;
 use crate::kernel::Kernel;
 use crate::math::{Point3, Vec3, BIG_DOUBLE, EFF_ZERO, EFF_ZERO_SQRT, PI};
-use crate::query::face::p2::{point_classify_prepared, PointClassifyOptions};
-use crate::surface::surface::p2::{surface_cache, Surface, SurfaceKind};
+use crate::query::face::p2::{
+    point_classify_prepared, point_classify_requested, PointClassifyOptions,
+};
+use crate::surface::surface::p2::{surface_cache, Surface, B_SPLINE_SURFACE_TYPE};
 use crate::surface::surface_cache::p1::{AltCacheKey, AltSrfCacheType};
 use crate::surface::trim_srf_cache::POINT_CLASS_UNKNOWN;
+use crate::topology::face::p2::create_curves_by_trimming_snapshot;
 
 const OP_MAY: &str = "intersect::topology_solver::p1::TopologySolver::may_contain_answer";
 const OP_TWO_TREES: &str = "intersect::topology_solver::p1::TopologySolver::solve_two_trees";
@@ -128,6 +131,45 @@ const fn null_deref(operation: &'static str, reason: &'static str) -> SolidError
 /// call (upstream reaches these through casts of `SmObject*` and the
 /// `SmVertex`/`SmEdge`/`SmFace`/`SmSurface` members).
 pub trait TopologyObjects<O> {
+    /// Optional owning-face cache service for surface solves.
+    fn surface_solve_context(
+        &self,
+    ) -> Option<Box<dyn crate::surface::surface::p1::SurfaceSolveContext<O> + '_>>
+    where
+        O: Copy + PartialEq,
+    {
+        None
+    }
+
+    /// An optional live topology classifier for callers that can prepare trims in place.
+    fn classify_face_point(
+        &self,
+        _k: &Kernel,
+        _face: O,
+        _uv: crate::math::Point2,
+        _tolerance: f64,
+        _boundaries: bool,
+        _use_uv: bool,
+    ) -> Option<Result<i32>> {
+        None
+    }
+
+    /// Optional live `Point3DClassify` test, including the native tolerance retry.
+    fn classifies_on_face(
+        &self,
+        _k: &Kernel,
+        _face: O,
+        _point: Point3,
+        _tolerance: f64,
+    ) -> Option<Result<bool>> {
+        None
+    }
+
+    /// Optional operation-local request for a UV trim needed by classification.
+    fn uv_trim_preparation(&self) -> Option<&crate::query::brep::RayPreparation> {
+        None
+    }
+
     /// The cache associated with a B-rep handle. Adapters that expose B-reps
     /// provide this, or override `brep_trees` with their own tree storage.
     fn brep_cache(&self, _brep: O) -> Result<&crate::topology::brep_cache::BrepCache<O>> {
@@ -245,6 +287,9 @@ pub trait TopologyObjects<O> {
         let _ = (k, object);
         // UNPORTED(geom.tol): SmTol::GetZoneTol3d(const SmObject*) on a handle this
         // adapter does not resolve to its B-rep entity
+        // Proof (unreachable): only Rayfire solvers read this; the library ones
+        // (offset_geometry_creation, brep p2) pass a resolver or override
+        // object_zone_tol_3d; 0 hits in the green difftest sweep.
         Err(SolidError::unported(
             "SmTol::GetZoneTol3d(const SmObject*)",
             "geom.tol",
@@ -345,6 +390,11 @@ pub struct LocalSolver<'a, O> {
     pub curve_face2: Option<O>,
     /// `m_pSurfaceCurve2` (`SmTLSCurveCurve`).
     pub surface_curve2: Option<&'a Curve>,
+    /// The curves are temporary (a face's silhouette curves, upstream's curve objects
+    /// made for this solve): their solves name no handle of their own, so their
+    /// solutions name the curves themselves, with their natural intervals, as
+    /// upstream's do (the face stands in only for the results).
+    pub(super) temporary_curves: bool,
 }
 
 /// `SmTopologySolver::GetBestAnswerSoFar` of the solver state `s`: the best answer
@@ -798,6 +848,7 @@ impl<'t, 'a, O: SolutionObject + 't> TopologySolver<'t, 'a, O> {
     /// longer exists).
     pub(super) fn restore_base(&mut self, s: GlobalSolver<'_, O>, tree2: &'t Tree<O>) {
         let GlobalSolver {
+            fixes,
             operation,
             category,
             projected_operation,
@@ -815,6 +866,7 @@ impl<'t, 'a, O: SolutionObject + 't> TopologySolver<'t, 'a, O> {
             branches_visited,
         } = s;
         self.base = GlobalSolver {
+            fixes,
             operation,
             category,
             projected_operation,
@@ -903,7 +955,8 @@ impl<O: SolutionObject> ParameterDomains<O> for TopologyDomains<'_, O> {
             self.objects
                 .surface(*surface)
                 .ok()
-                .map(Surface::natural_uv_domain)
+                // (kernel-free: a lazy analytic answers its NURB-less base's empty domain)
+                .map(Surface::natural_uv_domain_if_built)
         })
     }
 }
@@ -939,6 +992,7 @@ impl<'a, O> LocalSolver<'a, O> {
             curve_edge2: None,
             curve_face2: None,
             surface_curve2: None,
+            temporary_curves: false,
         }
     }
 
@@ -1398,8 +1452,12 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
             //   The target point is stored in m_vPoint, not the input args.
             //   So - put curve in as both args makes sure this works
             //        no matter the value of m_bSwapOrder
-            let curve = objects.curve(handle)?;
-            self.point_curve(k, ts, curve, Some(handle))?;
+            // the solve builds the edge curve's cache at the edge's tolerance
+            // (SmTol::GetApproxTol3d(&m_crCurve) reads pEdge->GetTolerance() through the
+            // owner)
+            let mut curve = objects.curve(handle)?.clone_for_evaluation()?;
+            curve.set_owner_zone_tol_3d(Some(objects.edge_tolerance(edge)?));
+            self.point_curve(k, ts, &curve, Some(handle))?;
         }
 
         Ok(())
@@ -1497,16 +1555,34 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
             let face_tol = objects.face_tolerance(face)?;
             // pFace->GetSurface()->GlobalLineIntersect(uv_domain, point, line_vec, NULL,
             // ray_fire, tol, solutions) (SER)
-            let solutions = objects.surface(face_surface)?.global_line_intersect(
-                ts.kernel,
-                face_surface,
-                &uv_domain,
-                self.point,
-                line_vec,
-                None,
-                ray_fire,
-                tol + face_tol,
-            )?;
+            let mut context = objects.surface_solve_context();
+            let solutions = if let Some(context) = context.as_deref_mut() {
+                objects
+                    .surface(face_surface)?
+                    .global_line_intersect_with_context(
+                        ts.kernel,
+                        Some(face_surface),
+                        None,
+                        context,
+                        &uv_domain,
+                        self.point,
+                        line_vec,
+                        None,
+                        ray_fire,
+                        tol + face_tol,
+                    )?
+            } else {
+                objects.surface(face_surface)?.global_line_intersect(
+                    ts.kernel,
+                    face_surface,
+                    &uv_domain,
+                    self.point,
+                    line_vec,
+                    None,
+                    ray_fire,
+                    tol + face_tol,
+                )?
+            };
 
             for found in solutions.as_slice() {
                 let mut sol = *found;
@@ -1585,10 +1661,14 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
             let face_surface = objects.face_surface(face)?;
             let uv_domain = objects.face_uv_domain(face)?;
             let face_tol = objects.face_tolerance(face)?;
+            // (SER) the surface reaches its face's cache through the caller's
+            // context (`smsurf_GetSurfaceCache`), when it provides one
+            let mut context = objects.surface_solve_context();
             let solutions = surface_global_point_solve(
                 ts.kernel,
                 face_surface,
                 objects.surface(face_surface)?,
+                context.as_deref_mut(),
                 &uv_domain,
                 op,
                 self.point,
@@ -1739,6 +1819,9 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
         } else {
             (curve1, &self.interval, curve2, &self.interval2)
         };
+        // a temporary curve's solve names the curve objects (their natural intervals),
+        // not the face standing in for it (`temporary_curves`)
+        let temporary = self.temporary_curves;
         let solutions = if op == SolverOperation::Intersect {
             this.curve.global_curve_intersect(
                 ts.kernel,
@@ -1748,11 +1831,19 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
                 s.tolerance_3d,
                 &CurveIntersectOptions {
                     skip_global_coincidence_check: false,
-                    handles: [Some(this.handle), Some(other.handle)],
-                    analytic_handles: [
-                        objects.analytic_curve_handle(this.handle),
-                        objects.analytic_curve_handle(other.handle),
-                    ],
+                    handles: if temporary {
+                        [None, None]
+                    } else {
+                        [Some(this.handle), Some(other.handle)]
+                    },
+                    analytic_handles: if temporary {
+                        [None, None]
+                    } else {
+                        [
+                            objects.analytic_curve_handle(this.handle),
+                            objects.analytic_curve_handle(other.handle),
+                        ]
+                    },
                 },
             )?
         } else {
@@ -1762,6 +1853,7 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
                 this_interval,
                 other,
                 other_interval,
+                temporary,
                 &CurveSolveArgs {
                     operation: op,
                     tolerance_3d: s.tolerance_3d,
@@ -1846,7 +1938,17 @@ impl<'a, O: SolutionObject> LocalSolver<'a, O> {
 /// vector `opt_vectors[0]` (3D curves and their UV trim curves), taken from the
 /// surface cache's alternate caches or made and cached there (silhouette curves of
 /// the surface to ten times `tolerance_3d` and 20 degrees, trimmed by the face).
-pub(super) fn face_silhouettes<O: Copy + PartialEq>(
+/// The surface cache is the one the caller's
+/// [`TopologyObjects::surface_solve_context`] makes for the face's surface (else the
+/// per-call [`surface_cache`]); either is this call's copy, so the alternate caches
+/// it searches first hold only what this call adds. The trimming works on the face
+/// [`TopologyObjects::face_entity`] resolves, which the objects lend read-only, so it
+/// classifies on a copy of that B-rep and drops the lazy edits upstream's `const`
+/// `CreateCurvesByTrimming` leaves on it; an adapter that resolves none returns
+/// [`SolidError::Unported`] for `SmFace::CreateCurvesByTrimming`. A trimmed UV curve
+/// that is not a B-spline (upstream caches it as NULL and `GetCopyOfCurves` fails
+/// on it) is `SM_ERR_NULL_POINTER`.
+pub(super) fn face_silhouettes<O: SolutionObject>(
     k: &Kernel,
     objects: &dyn TopologyObjects<O>,
     face: O,
@@ -1856,7 +1958,10 @@ pub(super) fn face_silhouettes<O: Copy + PartialEq>(
     // locals and temporaries
     let surface = objects.face_surface(face)?;
     let srf = objects.surface(surface)?;
-    let cache = surface_cache(k, srf, Some(surface))?;
+    let mut cache = match objects.surface_solve_context() {
+        Some(mut ctx) => ctx.build_surface_cache(k, srf, Some(surface))?,
+        None => surface_cache(k, srf, Some(surface))?,
+    };
     let view = *opt_vectors
         .first()
         .ok_or(null_deref(OP_FACE_SIL, "no view vector"))?;
@@ -1885,9 +1990,9 @@ pub(super) fn face_silhouettes<O: Copy + PartialEq>(
     }
 
     // No cached trimmed silhouette curves in existance -- create them
-    // (SM_CAST_PTR(SmBSplineSurface, pSurface): upstream dereferences NULL for any
-    // other kind)
-    if !matches!(srf.kind(), SurfaceKind::BSpline(_) | SurfaceKind::Plane(_)) {
+    // (SM_CAST_PTR(SmBSplineSurface, pSurface): every kind derived from it; upstream
+    // dereferences NULL for any other kind)
+    if !srf.is_kind_of(B_SPLINE_SURFACE_TYPE)? {
         return Err(null_deref(
             OP_FACE_SIL,
             "face surface is not a B-spline surface",
@@ -1895,8 +2000,9 @@ pub(super) fn face_silhouettes<O: Copy + PartialEq>(
     }
 
     // Create the planar section curves from the brep and the plane
-    let (_curves_3d, _curves_uv) = srf.create_silhouette_curves(
+    let (curves_3d, curves_uv) = srf.create_silhouette_curves_with_cache(
         k,
+        &mut cache,
         &objects.face_uv_domain(face)?,
         view,
         false,
@@ -1904,37 +2010,107 @@ pub(super) fn face_silhouettes<O: Copy + PartialEq>(
         Some(angle_tol),
     )?;
 
-    // Now trim the curves (then SmSurfaceCache::AddCurvesToCache(SM_AS_TRIMMED_SILHOUETTE,
-    // ..) and HasCachedCurves again, SM_ERR when they are not found).
-    // UNPORTED(topology.face_p2): SmFace::CreateCurvesByTrimming
-    Err(SolidError::unported(
-        "SmFace::CreateCurvesByTrimming",
-        "topology.face_p2",
-    ))
+    // Now trim the curves.
+    let Some((b, f)) = objects.face_entity(face) else {
+        // DISPATCH GAP: SmFace::CreateCurvesByTrimming is ported (`topology::face::p2`),
+        // but this adapter cannot resolve the face handle to its `Brep` and `FaceId`.
+        return Err(SolidError::unported(
+            "SmFace::CreateCurvesByTrimming",
+            "topology.face_p2",
+        ));
+    };
+    let curves_3d: Vec<Option<Curve>> = curves_3d.into_iter().map(Some).collect();
+    let curves_uv: Vec<Option<Curve>> = curves_uv.into_iter().map(Some).collect();
+    let trimmed = create_curves_by_trimming_snapshot(
+        k,
+        b,
+        f,
+        Some(approx_tol),
+        Some(&curves_3d),
+        Some(&curves_uv),
+        true,
+        true,
+    )?;
+    let trim_3d = trimmed.curves_3d.unwrap_or_default();
+    // a NULL UV entry (an interval of a non-B-spline UV curve) has no Rust cache slot;
+    // upstream's later GetCopyOfCurves stops at it with SM_ERR_NULL_POINTER
+    let trim_uv = trimmed
+        .uv_curves
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Option<Vec<Curve>>>()
+        .ok_or(SolidError::null_pointer(OP_FACE_SIL))?;
+
+    // Register trimmed curves and create copy by getting them again
+    cache.add_curves_to_cache(
+        AltSrfCacheType::TrimmedSilhouette,
+        approx_tol,
+        angle_tol,
+        &key,
+        Some(trim_3d),
+        Some(trim_uv),
+    )?;
+
+    // Don't clean up here we just use the curves that were created
+    match cache.has_cached_curves(
+        AltSrfCacheType::TrimmedSilhouette,
+        approx_tol,
+        angle_tol,
+        &key,
+        true,
+        true,
+    )? {
+        Some(copies) => Ok((
+            copies.curves_3d.unwrap_or_default(),
+            copies.curves_uv.unwrap_or_default(),
+        )),
+        None => Err(SolidError::sm_err(OP_FACE_SIL)),
+    }
 }
 
 /// `pFace->GetSurface()->GlobalPointSolve(uv_domain, op, point, tol,
-/// pdBestAnswer, SM_SR_ALL, solutions)`.
+/// pdBestAnswer, SM_SR_ALL, solutions)`. `context` is the caller's owning-face
+/// service: the fast drop's trim test reaches the face's cache and classifies
+/// through it.
+#[allow(clippy::too_many_arguments)]
 fn surface_global_point_solve<O: SolutionObject>(
     kernel: &Kernel,
     handle: O,
     surface: &Surface,
+    context: Option<&mut (dyn crate::surface::surface::p1::SurfaceSolveContext<O> + '_)>,
     uv_domain: &Extent2d,
     op: SolverOperation,
     point: Point3,
     tol: f64,
     best_answer: Option<f64>,
 ) -> Result<SolutionArray<O>> {
-    surface.global_point_solve::<O>(
+    let Some(context) = context else {
+        return surface.global_point_solve::<O>(
+            kernel,
+            Some(handle),
+            uv_domain,
+            op,
+            point,
+            tol,
+            best_answer,
+            SolutionRequested::All,
+        );
+    };
+    let mut solutions = SolutionArray::new();
+    surface.global_point_solve_into_with_context(
         kernel,
         Some(handle),
+        None,
+        context,
         uv_domain,
         op,
         point,
         tol,
         best_answer,
         SolutionRequested::All,
-    )
+        &mut solutions,
+    )?;
+    Ok(solutions)
 }
 
 /// The arguments of `SmCurve::GlobalCurveSolve` after the two curves and their
@@ -1960,6 +2136,7 @@ fn curve_global_curve_solve<O: SolutionObject>(
     this_interval: &Extent1d,
     other: CurveRef<'_, O>,
     other_interval: &Extent1d,
+    temporary: bool,
     args: &CurveSolveArgs<'_>,
 ) -> Result<SolutionArray<O>> {
     this.curve.global_curve_solve(
@@ -1972,7 +2149,11 @@ fn curve_global_curve_solve<O: SolutionObject>(
         &CurveSolveOptions {
             target_distance: args.best_answer,
             opt_vectors: args.opt_vectors,
-            handles: [Some(this.handle), Some(other.handle)],
+            handles: if temporary {
+                [None, None]
+            } else {
+                [Some(this.handle), Some(other.handle)]
+            },
         },
         args.requested,
     )
@@ -2022,10 +2203,11 @@ pub(super) fn curve_zone_tol_3d<O>(
 ///
 /// The solver only reads its objects, so this is the read-only
 /// [`point_classify_prepared`]: a classification that would have to create a UV trim
-/// curve or build a trim-cache tree first is [`SolidError::Unported`]. No trimmed
+/// curve or build a trim-cache tree first is [`SolidError::Unported`]. An object view
+/// may also record the visited edge use for its mutable caller to prepare. No trimmed
 /// surface cache is passed (the solver's objects expose none), so upstream's cache
 /// fast path is skipped and the loops classify the point.
-pub(super) fn face_point_classify<O>(
+pub(super) fn face_point_classify<O: Copy>(
     k: &Kernel,
     objects: &dyn TopologyObjects<O>,
     face: O,
@@ -2034,6 +2216,11 @@ pub(super) fn face_point_classify<O>(
     do_boundaries: bool,
     use_uv: bool,
 ) -> Result<i32> {
+    if let Some(result) =
+        objects.classify_face_point(k, face, uv, src_zone_tol, do_boundaries, use_uv)
+    {
+        return result;
+    }
     let Some((b, f)) = objects.face_entity(face) else {
         // DISPATCH GAP: SmFace::PointClassify is ported (`query::face::p2`, query.face_p2
         // partial; no UNPORTED marker), but this adapter cannot resolve the face handle
@@ -2044,20 +2231,23 @@ pub(super) fn face_point_classify<O>(
         ));
     };
     let mut pc = PointClassification::new(src_zone_tol);
-    match point_classify_prepared(
-        k,
-        b,
-        f,
-        uv,
-        &mut pc,
-        PointClassifyOptions {
-            src_zone_tol_3d: src_zone_tol,
-            do_boundary_intersections: do_boundaries,
-            use_uv_classification: use_uv,
-            ..PointClassifyOptions::default()
-        },
-    ) {
-        Err(e @ (SolidError::Unported { .. } | SolidError::InvalidInput { .. })) => Err(e),
+    let options = PointClassifyOptions {
+        src_zone_tol_3d: src_zone_tol,
+        do_boundary_intersections: do_boundaries,
+        use_uv_classification: use_uv,
+        ..PointClassifyOptions::default()
+    };
+    let result = match objects.uv_trim_preparation() {
+        Some(preparation) => point_classify_requested(k, b, f, uv, &mut pc, options, preparation),
+        None => point_classify_prepared(k, b, f, uv, &mut pc, options),
+    };
+    match result {
+        Err(
+            e @ (SolidError::Unported { .. }
+            | SolidError::InvalidInput { .. }
+            | SolidError::PortInvariant { .. }
+            | SolidError::PreparationRequired { .. }),
+        ) => Err(e),
         // (status ignored, as upstream)
         Ok(()) | Err(_) => Ok(pc.point_class().code()),
     }
@@ -2073,7 +2263,7 @@ pub(super) fn face_point_classify<O>(
 /// objects shared; upstream's `const` member may add UV trim curves and a trimmed
 /// surface cache to the B-rep, which the copy does not keep). Both tries classify on
 /// the same copy, as upstream's on the same face.
-fn face_classifies_on_face<O>(
+fn face_classifies_on_face<O: Copy>(
     k: &Kernel,
     objects: &dyn TopologyObjects<O>,
     face: O,
@@ -2083,6 +2273,9 @@ fn face_classifies_on_face<O>(
     use crate::error::EntityRef;
     use crate::intersect::point_class::PointClassType;
     use crate::query::face::p1::{point_3d_classify, Point3dClassifyOptions};
+    if let Some(result) = objects.classifies_on_face(k, face, point, tol) {
+        return result;
+    }
     let Some((b, f)) = objects.face_entity(face) else {
         // DISPATCH GAP: this adapter cannot resolve the face handle to its `Brep` and
         // `FaceId` (`TopologyObjects::face_entity`).
@@ -2213,8 +2406,12 @@ pub(crate) mod tests {
                 _ => Err(SolidError::sm_err("edge")),
             }
         }
-        fn edge_tolerance(&self, _edge: Obj) -> Result<f64> {
-            Err(SolidError::sm_err("edge"))
+        fn edge_tolerance(&self, edge: Obj) -> Result<f64> {
+            // SmEdge's default tolerance (the point/edge solve reads it for the cache)
+            match edge {
+                Obj::Edge(_) => Ok(0.0),
+                _ => Err(SolidError::sm_err("edge")),
+            }
         }
         fn surface_face(&self, _surface: Obj) -> Result<Option<Obj>> {
             Ok(None)
@@ -2429,6 +2626,7 @@ pub(crate) mod tests {
         let mut b = Brep::new();
         let f = crate::query::face::p2::tests::square(&mut b);
         let objects = BrepObjects {
+            preparation: None,
             brep: &b,
             brep_id: BrepId::from_index(0),
             cache: None,
@@ -2458,6 +2656,7 @@ pub(crate) mod tests {
                 .uv_trim_curve = None;
         }
         let objects = BrepObjects {
+            preparation: None,
             brep: &b,
             ..objects
         };

@@ -30,7 +30,6 @@
 //! part (analytic surfaces and curves) is deferred as `topology.edgeuse_p2`'s runner
 //! defers it.
 
-use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -40,11 +39,15 @@ use solidcore::blend::fillet_corner::p3::{
     CornerEnv, FilletCorner, FilletCornerKind, FilletExecutiveData,
 };
 use solidcore::blend::fillet_geom::p1::{FilStatus, FilletEdgeType, FilletSolverId};
+use solidcore::blend::fillet_solver::p1::{FilletSolver, FilletSurfaceGenerator};
 use solidcore::curve::curve::Curve;
 use solidcore::geom::extent2d::Extent2d;
 use solidcore::geom::vector2d::{Point2, Vec2};
 use solidcore::kernel::Kernel;
-use solidcore::math::Vec3;
+use solidcore::boolean::topology_intersector::p1::TopologyIntersector;
+use solidcore::geom::solution_array::{ObjectKind, SolutionObject};
+use solidcore::intersect::point_class::{ClassObject, ClassObjectKind};
+use solidcore::math::{Vec3, EFF_ZERO_RAD, EFF_ZERO_SQ};
 use solidcore::nurbs::b_spline_surface::p1::SurfParamType;
 use solidcore::nurbs::math::NOW;
 use solidcore::surface::plane::Plane;
@@ -53,16 +56,15 @@ use solidcore::topology::edgeuse::p1 as eu1;
 use solidcore::topology::{edge, Brep, EdgeId, EdgeuseId, VertexId};
 use solidcore::SolidError;
 use solidcore_ffi::units::blend_fillet_corner_p1::{self as ffi, CornerOp as FfiCornerOp, Op};
-use solidcore_ffi::units::topology_edgeuse_p1 as ffi1;
 
 use super::blend_fillet_geom_p1::{
     curve_of as model_curve_of, gen_curve as model_gen_curve, gen_model, push_model,
-    status as model_status, Crv, Model, RustModel,
+    status as model_status, Crv, Model, RustModel, Srf,
 };
 
 use super::topology_edgeuse_p1::{
     brep_block_of, bspline_of, domain, flag, gen_brep, gen_curve, gen_surface, harness,
-    import_with_types, path_of, push_curve, push_surface, sel, surface_of, BrepIn, CrvIn,
+    path_of, push_curve, push_surface, sel, surface_of, BrepIn, CrvIn,
     ImportTypes, SrfIn,
 };
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
@@ -75,7 +77,7 @@ pub(super) const NULL_DEREF: &str = "upstream dereferences null";
 
 /// The box-like fillet test files (planar faces with convex and concave corners, one
 /// all-NURBS box, one with a cylinder; filleted and B-spline parts whose tangential
-/// edges reach the success paths of the tangency tests). Not `SmallBox.smb`: `SmBrep::ReadFromFile`
+/// edges reach the success paths of the tangency tests). Not `SmallBox.smp`: `SmBrep::ReadFromFile`
 /// crashes on it (UB-1).
 pub(super) const CORNER_FILES: [&str; 13] = [
     "Fillet/box1x1x2.smb",
@@ -193,6 +195,12 @@ enum Inputs {
         /// `fix_degeneracy`: the executive's topology edges (model edges).
         #[serde(default)]
         topo: Vec<usize>,
+        /// `make_face` / `insert`: the corner's surfaces (`m_vSurfaces`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        surfaces: Vec<Srf>,
+        /// `const_rad`: per model geometry its solver's surface generator.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        fsgs: Vec<FsgIn>,
     },
 }
 
@@ -220,6 +228,12 @@ enum CornerMethod {
     FixDegeneracy,
     /// `CreateEndPatch`.
     EndPatch,
+    /// `MakeFaceBrep` on the given surfaces.
+    MakeFace,
+    /// `InsertIntersectionTopology` with the given surfaces.
+    Insert,
+    /// `MakeConstantRadiusFillet` with a solver per model geometry.
+    ConstRad,
 }
 
 impl CornerMethod {
@@ -235,6 +249,9 @@ impl CornerMethod {
             Self::EdgeGeom => FfiCornerOp::EdgeGeom,
             Self::FixDegeneracy => FfiCornerOp::FixDegeneracy,
             Self::EndPatch => FfiCornerOp::EndPatch,
+            Self::MakeFace => FfiCornerOp::MakeFace,
+            Self::Insert => FfiCornerOp::Insert,
+            Self::ConstRad => FfiCornerOp::ConstRad,
         }
     }
 }
@@ -251,7 +268,8 @@ struct CornerIn {
     /// The derived class (order of [`FilletCornerKind`]).
     kind: usize,
     /// The filleted vertex: start (`v_sub` 0) or end vertex of target edge `v_edge`
-    /// (`-1` none).
+    /// (`-1` none); for `v_edge <= -2` vertex `v_sub` of target face `-(v_edge + 2)`
+    /// (`SmFace::GetVertices` order).
     v_edge: i64,
     #[serde(default)]
     v_sub: usize,
@@ -324,6 +342,22 @@ struct SolverRegIn {
     tang: f64,
 }
 
+/// The fillet solver of a model geometry in a `const_rad` case: `kind` -1 none, 0
+/// `SmCircularCrossSectionFSG()`, 1 `SmBlendCurveCrossSectionFSG(scale, continuity)`, 2
+/// `SmLinearCrossSectionFSG`, 3 the base `SmFilletSurfaceGenerator`, 4 no generator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FsgIn {
+    kind: i64,
+    #[serde(default = "one_and_a_half")]
+    scale: f64,
+    #[serde(default)]
+    continuity: u32,
+}
+
+fn one_and_a_half() -> f64 {
+    1.5
+}
+
 /// An `AddExtendedOriginalSurface` call: the target face and the plane's domain size.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExtAddIn {
@@ -357,7 +391,7 @@ fn v3(a: [f64; 3]) -> Vec3 {
 fn status_of(e: &SolidError) -> Option<f64> {
     match e {
         SolidError::Upstream { code, .. } => Some(f64::from(*code)),
-        SolidError::InvalidInput { reason, .. } if *reason != NULL_DEREF => Some(1007.0),
+        SolidError::InvalidInput { reason, .. } | SolidError::PortInvariant { reason, .. } if *reason != NULL_DEREF => Some(1007.0),
         _ => None,
     }
 }
@@ -368,7 +402,7 @@ pub(super) fn rust_err(e: &SolidError) -> Output {
     if let Some(o) = Output::unported(e) {
         return o;
     }
-    if matches!(e, SolidError::InvalidInput { reason, .. } if *reason == NULL_DEREF) {
+    if matches!(e, SolidError::InvalidInput { reason, .. } | SolidError::PortInvariant { reason, .. } if *reason == NULL_DEREF) {
         return Output::err("refused");
     }
     match status_of(e) {
@@ -498,7 +532,7 @@ fn pick(s: i64, ring: &[i64], n: usize) -> i64 {
 /// Builds and imports the B-rep and resolves the selectors of `i`; `Err(output)` when the
 /// case ends before the op (the B-rep cannot be built, a required entity is missing),
 /// with the same output on both sides.
-fn topo(i: &Inputs) -> Result<Result<Topo, Output>, HarnessError> {
+fn topo(i: &Inputs, own: bool) -> Result<Result<Topo, Output>, HarnessError> {
     let (Inputs::G1 { brep, .. }
     | Inputs::FaceByTwo { brep, .. }
     | Inputs::Tangential { brep, .. }
@@ -509,14 +543,13 @@ fn topo(i: &Inputs) -> Result<Result<Topo, Output>, HarnessError> {
     };
     let path = path_of(Some(brep))?;
     let block = brep_block_of(Some(brep), false, false)?;
-    let ex = ffi1::eval(ffi1::Op::Export, &path, &block)
-        .map_err(|e| harness(format!("c++ export: {e}")))?;
-    let Some(c) = ffi1::counts(&ex) else {
-        let st = ex.get(1).copied().unwrap_or(0.0);
-        return Ok(Err(Output::err(format!("brep_build_status_{st}"))));
+    // the Rust side's B-rep is read or built by the Rust kernel, never imported
+    // (`crate::own_reader::edgeuse_case`)
+    let (c, b, types) = match crate::own_reader::edgeuse_case(brep, false, false, own)? {
+        Ok(x) => x,
+        Err(o) => return Ok(Err(o)),
     };
     let (n_eu, n_e, n_v) = (c[6], c[7], c[9]);
-    let (b, types) = import_with_types(&ex)?;
 
     // the edge uses starting at `v`, the edges ending at `v` (export order)
     let ring_eus = |v: i64| -> Vec<i64> {
@@ -682,9 +715,7 @@ pub(super) fn inexact(t: &Topo, edges: &[EdgeId], eus: &[EdgeuseId]) -> Option<O
     for e in all_edges {
         let ct = t
             .types
-            .edge_curve_types
-            .get(e.index() as usize)
-            .copied()
+            .inexact_curve(e.index() as usize)
             .unwrap_or(-1);
         if ct >= 0 && !EXACT_CURVES.contains(&ct) {
             return Some(Output::deferred(
@@ -754,7 +785,7 @@ fn run_cpp(i: &Inputs) -> Result<Output, HarnessError> {
         }
         Inputs::Corner { .. } => corner_cpp(i),
         _ => {
-            let t = match topo(i)? {
+            let t = match topo(i, false)? {
                 Ok(t) => t,
                 Err(o) => return Ok(o),
             };
@@ -837,7 +868,7 @@ fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
         }
         Inputs::Corner { .. } => corner_rust(i),
         _ => {
-            let mut t = match topo(i)? {
+            let mut t = match topo(i, true)? {
                 Ok(t) => t,
                 Err(o) => return Ok(o),
             };
@@ -899,7 +930,7 @@ fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
                     match corner::check_nx1_degeneracy(&k, &mut t.brep, v, e) {
                         Ok(f) => Ok(vec![flag(f)]),
                         Err(e) if e.is_unported() => Err(e),
-                        Err(e) if matches!(&e, SolidError::InvalidInput { reason, .. } if *reason == NULL_DEREF) => {
+                        Err(e) if matches!(&e, SolidError::InvalidInput { reason, .. } | SolidError::PortInvariant { reason, .. } if *reason == NULL_DEREF) => {
                             Err(e)
                         }
                         Err(e) => Ok(vec![model_status(&e)]),
@@ -1346,13 +1377,15 @@ impl UnitDiff for Runner {
     }
 
     fn generate(&self, rng: &mut Rng) -> Option<Value> {
-        let i = match rng.below(16) {
+        let i = match rng.below(20) {
             0 | 1 => gen_planar(rng),
             2..=4 => gen_revolution(rng),
             5 => gen_fillet_radius(rng),
             6 => gen_seam_out(rng),
             7 => gen_closure(rng),
             8..=11 => gen_topology(rng),
+            16 | 17 => gen_face_corner(rng),
+            18 | 19 => gen_const_rad_corner(rng),
             _ => gen_corner(rng),
         };
         serde_json::to_value(i).ok()
@@ -1388,6 +1421,8 @@ struct CornerCase<'a> {
     squeeze: usize,
     curve: Option<&'a Crv>,
     topo: &'a [usize],
+    surfaces: &'a [Srf],
+    fsgs: &'a [FsgIn],
 }
 
 fn corner_case(i: &Inputs) -> Result<CornerCase<'_>, HarnessError> {
@@ -1403,6 +1438,8 @@ fn corner_case(i: &Inputs) -> Result<CornerCase<'_>, HarnessError> {
         squeeze,
         curve,
         topo,
+        surfaces,
+        fsgs,
     } = i
     else {
         return Err(harness("not a corner case"));
@@ -1419,6 +1456,8 @@ fn corner_case(i: &Inputs) -> Result<CornerCase<'_>, HarnessError> {
         squeeze: *squeeze,
         curve: curve.as_ref(),
         topo,
+        surfaces,
+        fsgs,
     })
 }
 
@@ -1489,6 +1528,18 @@ fn corner_input(c: &CornerCase<'_>) -> Result<Vec<f64>, HarnessError> {
             o.push(c.topo.len() as f64);
             o.extend(c.topo.iter().map(|&e| e as f64));
         }
+        CornerMethod::MakeFace | CornerMethod::Insert => {
+            o.push(c.surfaces.len() as f64);
+            for srf in c.surfaces {
+                super::blend_fillet_geom_p1::push_srf(&mut o, srf)?;
+            }
+        }
+        CornerMethod::ConstRad => {
+            o.push(c.fsgs.len() as f64);
+            for f in c.fsgs {
+                o.extend([f.kind as f64, f.scale, f64::from(f.continuity)]);
+            }
+        }
     }
     Ok(o)
 }
@@ -1547,6 +1598,202 @@ fn squeeze_output_rest(rec: &[f64]) -> Result<Output, HarnessError> {
         .values("model", model))
 }
 
+/// Splits an insertion record: `status`, the executive topology intersector's
+/// intersection table ([`put_ssi_table`]), the corner members, the model export.
+fn insert_output(rec: &[f64]) -> Result<Output, HarnessError> {
+    let st = *rec.first().ok_or_else(|| harness("record too short"))?;
+    let n = rec
+        .get(1)
+        .and_then(|&n| usize::try_from(n as i64).ok())
+        .ok_or_else(|| harness("ssi table count"))?;
+    let end = n
+        .checked_mul(3)
+        .and_then(|l| l.checked_add(2))
+        .ok_or_else(|| harness("ssi table count"))?;
+    let table = rec
+        .get(1..end)
+        .ok_or_else(|| harness("record too short"))?
+        .to_vec();
+    let mut out = vec![st];
+    out.extend(rec.get(end..).ok_or_else(|| harness("record too short"))?);
+    Ok(squeeze_output(&out)?.values("ssi_table", table))
+}
+
+/// A surface handle of the standalone executive's topology intersector table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TiSurface {
+    /// The surface of a target-B-rep face (`pFace->GetSurface()`).
+    Target(solidcore::topology::FaceId),
+    /// The surface of a fillet-B-rep face (`pFEFace->GetSurface()`).
+    Fillet(solidcore::topology::FaceId),
+    /// The corner's `m_vSurfaces[jj]`.
+    Corner(usize),
+}
+
+impl ClassObject for TiSurface {
+    fn class_kind(&self) -> ClassObjectKind {
+        ClassObjectKind::Surface
+    }
+}
+
+impl SolutionObject for TiSurface {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Surface
+    }
+}
+
+/// The executive the shim's `c1_insert` gives the corner: a bare `SmFilletExecutive`
+/// (its constructor's topology intersector and edge attribute, no `CreateFilletBrep`)
+/// with the Model's fillet B-rep as `m_pFilletBrep`. Its intersector is a real
+/// [`TopologyIntersector`] whose table `RegisterExistingSSI` fills; the merge
+/// (`MergeCurveOnSurfaces`, `UpdateTopologyChanges`) needs an edge-attribute user,
+/// which the bare executive has none of (as upstream), so reaching it is a harness
+/// error.
+struct StandaloneCornerInsertion<'a> {
+    fillet: &'a Brep,
+    attribute_e_users: &'a [EdgeId],
+    corner_surfaces: &'a [Surface],
+    ti: TopologyIntersector<TiSurface>,
+    merge_reached: bool,
+}
+
+impl StandaloneCornerInsertion<'_> {
+    fn target_surface(target: &Brep, face: solidcore::topology::FaceId) -> Result<Option<TiSurface>, SolidError> {
+        Ok(target.face(face)?.surface.is_some().then_some(TiSurface::Target(face)))
+    }
+}
+
+impl corner::CornerInsertionContext for StandaloneCornerInsertion<'_> {
+    type CurveBinding = ();
+    type SurfaceBinding = TiSurface;
+    type FaceMarker = ();
+    fn begin_corner(&mut self) -> Result<(), SolidError> {
+        Ok(())
+    }
+    fn capture_managed_curve(&mut self, edge: EdgeId) -> Result<Option<()>, SolidError> {
+        Ok(self.fillet.edge(edge)?.curve.as_ref().map(|_| ()))
+    }
+    fn capture_pseudo_curve(
+        &mut self,
+        pseudo: &mut solidcore::blend::fillet_geom::p1::FilletBrep,
+        edge: EdgeId,
+    ) -> Result<Option<()>, SolidError> {
+        Ok(pseudo.brep().edge(edge)?.curve.as_ref().map(|_| ()))
+    }
+    fn attribute_edges(&self) -> Result<Vec<EdgeId>, SolidError> {
+        Ok(self.attribute_e_users.to_vec())
+    }
+    fn managed_edge_faces(&self, e: EdgeId) -> Result<Vec<solidcore::topology::FaceId>, SolidError> {
+        edge::faces(self.fillet, e, None)
+    }
+    fn with_corner_face_scope<T>(
+        &mut self,
+        target: &mut Brep,
+        _face: solidcore::topology::FaceId,
+        body: impl FnOnce(&mut Self, &mut Brep, &()) -> Result<T, SolidError>,
+    ) -> Result<T, SolidError> {
+        self.merge_reached = true;
+        body(self, target, &())
+    }
+    fn merge_corner_curve(
+        &mut self,
+        _pseudo: &mut solidcore::blend::fillet_geom::p1::FilletBrep,
+        _target: &mut Brep,
+        _face: solidcore::topology::FaceId,
+        _curve: &Option<()>,
+        _managed_edge: EdgeId,
+    ) -> Result<(), SolidError> {
+        self.merge_reached = true;
+        Err(SolidError::invalid_input(
+            "difftest::blend_fillet_corner_p1",
+            "standalone executive has no merge backend",
+        ))
+    }
+    fn update_corner_topology(
+        &mut self,
+        _pseudo: &mut solidcore::blend::fillet_geom::p1::FilletBrep,
+        _target: &mut Brep,
+        _marker: &(),
+        _face: solidcore::topology::FaceId,
+    ) -> Result<(), SolidError> {
+        self.merge_reached = true;
+        Err(SolidError::invalid_input(
+            "difftest::blend_fillet_corner_p1",
+            "standalone executive has no topology-change bookkeeping",
+        ))
+    }
+    fn capture_managed_surface(
+        &mut self,
+        face: solidcore::topology::FaceId,
+    ) -> Result<Option<TiSurface>, SolidError> {
+        Ok(self.fillet.face(face)?.surface.is_some().then_some(TiSurface::Fillet(face)))
+    }
+    fn register_bound_intersection(
+        &mut self,
+        target: &mut Brep,
+        face: solidcore::topology::FaceId,
+        surface: &Option<TiSurface>,
+    ) -> Result<(), SolidError> {
+        let brep = Self::target_surface(target, face)?;
+        self.ti.register_empty_ssi(brep, *surface);
+        Ok(())
+    }
+    fn register_blending_intersection(
+        &mut self,
+        target: &mut Brep,
+        face: solidcore::topology::FaceId,
+        surface: &Surface,
+        _surface_face: Option<solidcore::topology::FaceId>,
+    ) -> Result<(), SolidError> {
+        // m_vSurfaces[jj]: the corner surface by identity
+        let jj = self
+            .corner_surfaces
+            .iter()
+            .position(|s| std::ptr::eq(s, surface))
+            .ok_or_else(|| {
+                SolidError::invalid_input("difftest::blend_fillet_corner_p1", "foreign corner surface")
+            })?;
+        let brep = Self::target_surface(target, face)?;
+        self.ti.register_empty_ssi(brep, Some(TiSurface::Corner(jj)));
+        Ok(())
+    }
+}
+
+/// The intersection table as the shim's `c1_put_ssi_table` writes it: `n`, then per
+/// entry the brep surface (index of its face in `vertex_faces`, `-1` for `NULL`, `-2`
+/// otherwise), the other surface (`jj` of a corner surface, `-1` for `NULL`, `-2`
+/// otherwise) and whether the entry has curve arrays.
+fn put_ssi_table(
+    rec: &mut Vec<f64>,
+    table: Option<&solidcore::boolean::topology_intersector::p1::IntersectionTable<TiSurface>>,
+    vertex_faces: &[solidcore::topology::FaceId],
+) {
+    let Some(t) = table else {
+        rec.push(0.0);
+        return;
+    };
+    rec.push(t.brep_surfaces.len() as f64);
+    for (ii, (b, o)) in t.brep_surfaces.iter().zip(&t.other_surfaces).enumerate() {
+        rec.push(match b {
+            None => -1.0,
+            Some(TiSurface::Target(f)) => vertex_faces
+                .iter()
+                .position(|v| v == f)
+                .map_or(-2.0, |i| i as f64),
+            Some(_) => -2.0,
+        });
+        rec.push(match o {
+            None => -1.0,
+            Some(TiSurface::Corner(jj)) => *jj as f64,
+            Some(_) => -2.0,
+        });
+        rec.push(match t.results.get(ii) {
+            Some(r) if r.curves.is_some() => 1.0,
+            _ => 0.0,
+        });
+    }
+}
+
 /// Splits a squeeze record: `status`, the corner members, the model export.
 fn squeeze_output(rec: &[f64]) -> Result<Output, HarnessError> {
     let get = |i: usize| {
@@ -1578,6 +1825,38 @@ fn squeeze_output(rec: &[f64]) -> Result<Output, HarnessError> {
         .values("model", model))
 }
 
+/// Splits a constant-radius record: `status has [surface]`, the corner members, the
+/// model export.
+fn const_rad_output(rec: &[f64]) -> Result<Output, HarnessError> {
+    let get = |i: usize| {
+        rec.get(i)
+            .copied()
+            .ok_or_else(|| harness("record too short"))
+    };
+    let count = |i: usize| -> Result<usize, HarnessError> {
+        usize::try_from(get(i)? as i64).map_err(|_| harness("count"))
+    };
+    let st = get(0)?;
+    let mut at = 2;
+    if get(1)? != 0.0 {
+        // the surface: `kind has n m p q r s cpts u v`
+        at += 1;
+        if get(at)? == 0.0 {
+            at += 1;
+        } else {
+            let (n, m, r, s) = (count(at + 1)?, count(at + 2)?, count(at + 5)?, count(at + 6)?);
+            at += 7 + 4 * (n + 1) * (m + 1) + (r + 1) + (s + 1);
+        }
+    }
+    let surface = rec
+        .get(1..at)
+        .ok_or_else(|| harness("record too short"))?
+        .to_vec();
+    let mut out = vec![st];
+    out.extend(rec.get(at..).ok_or_else(|| harness("record too short"))?);
+    Ok(squeeze_output(&out)?.values("surface", surface))
+}
+
 fn corner_cpp(i: &Inputs) -> Result<Output, HarnessError> {
     let c = corner_case(i)?;
     let input = corner_input(&c)?;
@@ -1597,14 +1876,19 @@ fn corner_cpp(i: &Inputs) -> Result<Output, HarnessError> {
     Ok(match c.method {
         CornerMethod::Peek => Output::new().values("peek", rest.to_vec()),
         CornerMethod::Solvers => Output::new().values("solvers", rest.to_vec()),
-        CornerMethod::ExtSurface => Output::new().values("domains", rest.to_vec()),
+        CornerMethod::ExtSurface => Output::new()
+            .int("n_domains", rest.len() as i64)
+            .values("domains", rest.to_vec()),
         CornerMethod::Reinit => Output::new().values("model", rest.to_vec()),
         CornerMethod::Squeeze
         | CornerMethod::VertGeom
         | CornerMethod::EdgeGeom
-        | CornerMethod::EndPatch => squeeze_output(rest)?,
+        | CornerMethod::EndPatch
+        | CornerMethod::MakeFace => squeeze_output(rest)?,
+        CornerMethod::Insert => insert_output(rest)?,
         CornerMethod::RailRail => Output::new().values("ret", rest.to_vec()),
         CornerMethod::FixDegeneracy => degeneracy_output(rest)?,
+        CornerMethod::ConstRad => const_rad_output(rest)?,
     })
 }
 
@@ -1614,7 +1898,7 @@ fn corner_err(e: &SolidError) -> Result<f64, Box<Output>> {
     if let Some(o) = Output::unported(e) {
         return Err(Box::new(o));
     }
-    if matches!(e, SolidError::InvalidInput { reason, .. } if *reason == NULL_DEREF) {
+    if matches!(e, SolidError::InvalidInput { reason, .. } | SolidError::PortInvariant { reason, .. } if *reason == NULL_DEREF) {
         return Err(Box::new(Output::err("refused")));
     }
     Ok(model_status(e))
@@ -1649,6 +1933,18 @@ fn corner_rust(i: &Inputs) -> Result<Output, HarnessError> {
         };
     let vertex_of =
         |rm: &RustModel, v_edge: i64, v_sub: usize| -> Result<Option<VertexId>, HarnessError> {
+            if v_edge <= -2 {
+                let f = usize::try_from(-(v_edge + 2)).map_err(|_| harness("target face"))?;
+                let face = *rm
+                    .target_faces
+                    .get(f)
+                    .ok_or_else(|| harness("target face"))?;
+                let vs = solidcore::topology::face::p4::vertices(&rm.target, face, None, false, None)
+                    .map_err(h)?;
+                return Ok(Some(
+                    *vs.get(v_sub).ok_or_else(|| harness("target face vertex"))?,
+                ));
+            }
             match usize::try_from(v_edge) {
                 Ok(e) => {
                     let edge = *rm
@@ -1824,13 +2120,16 @@ fn corner_rust(i: &Inputs) -> Result<Output, HarnessError> {
                 let face = *rm.target_faces.get(q).ok_or_else(|| harness("face"))?;
                 match fc.extended_surface(&exec, face) {
                     Some(s) => {
-                        let d = s.natural_uv_domain();
+                        // (runner helper without a kernel in scope)
+                        let d = s.natural_uv_domain_if_built();
                         rec.extend([d.max().x, d.max().y]);
                     }
                     None => rec.extend([-1.0, -1.0]),
                 }
             }
-            Ok(Output::new().values("domains", rec))
+            Ok(Output::new()
+                .int("n_domains", rec.len() as i64)
+                .values("domains", rec))
         }
         CornerMethod::Reinit => {
             if let Err(e) = fc.re_initialize_corner_edges(&mut rm.fb) {
@@ -1905,23 +2204,21 @@ fn corner_rust(i: &Inputs) -> Result<Output, HarnessError> {
             corner_rec(&fc, &rm, &mut rec)?;
             squeeze_output(&rec)
         }
-        CornerMethod::VertGeom | CornerMethod::EdgeGeom | CornerMethod::EndPatch => {
+        CornerMethod::VertGeom | CornerMethod::EdgeGeom => {
             let mut exec = FilletExecutiveData::default();
-            let surfaces = BTreeMap::new();
             let r = {
                 let mut env = CornerEnv {
-                    k: &rm.k,
+                    k: &mut rm.k,
                     target: &mut rm.target,
                     pseudo: &mut rm.fb,
                     exec: &mut exec,
                     corner: None,
-                    tsect_surfaces: &surfaces,
                     solvers: &mut [],
+                    fillet: None,
                 };
                 match c.method {
                     CornerMethod::VertGeom => fc.calc_corner_vert_geom(&mut env, &mut []),
-                    CornerMethod::EdgeGeom => fc.calc_corner_edge_geom(&mut env),
-                    _ => fc.create_end_patch(&mut env),
+                    _ => fc.calc_corner_edge_geom(&mut env),
                 }
             };
             let st = match r {
@@ -1935,21 +2232,151 @@ fn corner_rust(i: &Inputs) -> Result<Output, HarnessError> {
             corner_rec(&fc, &rm, &mut rec)?;
             squeeze_output(&rec)
         }
+        CornerMethod::Insert => {
+            for srf in c.surfaces {
+                fc.surfaces.push(super::blend_fillet_geom_p1::surface_of(srf)?);
+            }
+            // pFilletExec: a bare executive (no CreateFilletBrep, m_pAttributeE without
+            // users) over the Model's fillet B-rep as m_pFilletBrep
+            let exec = FilletExecutiveData::default();
+            let mut context = StandaloneCornerInsertion {
+                fillet: &rm.fillet,
+                attribute_e_users: &exec.attribute_e_users,
+                corner_surfaces: &fc.surfaces,
+                ti: TopologyIntersector::new(None, None, EFF_ZERO_SQ, 30.0_f64.to_radians()),
+                merge_reached: false,
+            };
+            let r = fc.insert_intersection_topology_with_context(
+                &mut rm.fb,
+                &mut rm.target,
+                &mut context,
+            );
+            if context.merge_reached {
+                return Err(harness(
+                    "insert: an attribute user reached the merge, which the standalone \
+                     executive has no backend for",
+                ));
+            }
+            let st = match r {
+                Ok(()) => 0.0,
+                Err(e) => match corner_err(&e) {
+                    Err(o) => return Ok(*o),
+                    Ok(st) => st,
+                },
+            };
+            let vertex_faces = match fc.vertex {
+                Some(v) => solidcore::topology::vertex::faces(&rm.target, v).map_err(h)?,
+                None => Vec::new(),
+            };
+            let mut rec = vec![st];
+            put_ssi_table(&mut rec, context.ti.intersection_table(), &vertex_faces);
+            corner_rec(&fc, &rm, &mut rec)?;
+            insert_output(&rec)
+        }
+        CornerMethod::EndPatch | CornerMethod::MakeFace => {
+            for srf in c.surfaces {
+                fc.surfaces.push(super::blend_fillet_geom_p1::surface_of(srf)?);
+            }
+            let mut exec = FilletExecutiveData::default();
+            // m_pFilletBrep: a new SmBrep for the face makers, the Model's fillet B-rep
+            // (holding the corner edges' fillet-B-rep edges) for the insertion
+            let mut new_brep = Brep::new_with_infinite_region().map_err(h)?;
+            let mut records = solidcore::topology::topology::NotifyRecords::new();
+            let mut attributes = solidcore::geom::attribute::AttributeStore::default();
+            let r = {
+                let fillet_brep = &mut new_brep;
+                let mut env = CornerEnv {
+                    k: &mut rm.k,
+                    target: &mut rm.target,
+                    pseudo: &mut rm.fb,
+                    exec: &mut exec,
+                    corner: None,
+                    solvers: &mut [],
+                    fillet: Some(super::blend_fillet_corner_p3::fillet_env(
+                        fillet_brep,
+                        &mut records,
+                        &mut attributes,
+                    )),
+                };
+                match c.method {
+                    CornerMethod::EndPatch => fc.create_end_patch(&mut env),
+                    _ => fc.make_face_brep(&mut env),
+                }
+            };
+            let st = match r {
+                Ok(()) => 0.0,
+                Err(e) => match corner_err(&e) {
+                    Err(o) => return Ok(*o),
+                    Ok(st) => st,
+                },
+            };
+            let mut rec = vec![st];
+            corner_rec(&fc, &rm, &mut rec)?;
+            super::blend_fillet_corner_p3::put_fillet_brep(&mut rec, &new_brep)?;
+            super::blend_fillet_corner_p3::put_error_info(&mut rec, &exec.error, fc.filleted_vertex());
+            squeeze_output(&rec)
+        }
+        CornerMethod::ConstRad => {
+            let mut solvers = Vec::new();
+            for (g, f) in c.fsgs.iter().enumerate() {
+                let gid = rm.geom(g)?;
+                if f.kind < 0 {
+                    rm.fb.geom_mut(gid).map_err(h)?.solver = None;
+                    continue;
+                }
+                let mut fs = FilletSolver::new(1e-3, EFF_ZERO_RAD, 1e-2);
+                fs.set_fillet_surface_generator(match f.kind {
+                    0 => Some(FilletSurfaceGenerator::circular_default()),
+                    1 => Some(FilletSurfaceGenerator::blend_curve(f.scale, f.continuity)),
+                    2 => Some(FilletSurfaceGenerator::Linear),
+                    3 => Some(FilletSurfaceGenerator::Base),
+                    _ => None,
+                });
+                rm.fb.geom_mut(gid).map_err(h)?.solver =
+                    Some(FilletSolverId(solvers.len() as u32));
+                solvers.push(fs);
+            }
+            let mut exec = FilletExecutiveData::default();
+            let r = {
+                let mut env = CornerEnv {
+                    k: &mut rm.k,
+                    target: &mut rm.target,
+                    pseudo: &mut rm.fb,
+                    exec: &mut exec,
+                    corner: None,
+                    solvers: &mut solvers,
+                    fillet: None,
+                };
+                fc.make_constant_radius_fillet(&mut env)
+            };
+            let (st, surface) = match r {
+                Ok(srf) => (0.0, Some(srf)),
+                Err(e) => match corner_err(&e) {
+                    Err(o) => return Ok(*o),
+                    Ok(st) => (st, None),
+                },
+            };
+            let mut rec = vec![st, flag(surface.is_some())];
+            if let Some(srf) = &surface {
+                super::blend_fillet_corner_p3::put_corner_surface(&mut rec, Some(srf))?;
+            }
+            corner_rec(&fc, &rm, &mut rec)?;
+            const_rad_output(&rec)
+        }
         CornerMethod::FixDegeneracy => {
             let mut exec = FilletExecutiveData::default();
             for &e in c.topo {
                 exec.topo_edges.push(Some(rm.edge(e)?));
             }
-            let surfaces = BTreeMap::new();
             let r = {
                 let mut env = CornerEnv {
-                    k: &rm.k,
+                    k: &mut rm.k,
                     target: &mut rm.target,
                     pseudo: &mut rm.fb,
                     exec: &mut exec,
                     corner: None,
-                    tsect_surfaces: &surfaces,
                     solvers: &mut [],
+                    fillet: None,
                 };
                 fc.check_and_fix_degeneracy(&mut env, &[])
             };
@@ -2009,6 +2436,10 @@ fn gen_corner(rng: &mut Rng) -> Inputs {
             CornerMethod::FixDegeneracy,
             CornerMethod::EndPatch,
             CornerMethod::EndPatch,
+            CornerMethod::MakeFace,
+            CornerMethod::Insert,
+            CornerMethod::Insert,
+            CornerMethod::ConstRad,
         ])
         .unwrap_or(&CornerMethod::Peek);
     let kind = if method == CornerMethod::RailRail {
@@ -2048,11 +2479,16 @@ fn gen_corner(rng: &mut Rng) -> Inputs {
     };
     let mut verts = subset(rng, nv);
     let mut edges = subset(rng, ne);
-    // the geometry steps run only on an empty list (their per-element callees are stubs)
-    if method == CornerMethod::VertGeom && rng.chance(0.5) {
+    // The geometry steps run on an empty list here. Their per-vertex / per-edge
+    // calculators (blend.fillet_geom_p2..p6) read corner, solver and executive data the
+    // generated models do not build, and upstream dereferences it unchecked (CalcVertOnVert,
+    // CalcSetBackVert, CalcRailIntExtendedEdgeuse, CalcFilletIntFillet, CalcMateGeom and
+    // the edge calculators of SmFilletEdge::CalcCornerEdgeGeom all crashed on random
+    // models); the fixtures compare them on hand-built corners.
+    if method == CornerMethod::VertGeom {
         verts.clear();
     }
-    if method == CornerMethod::EdgeGeom && rng.chance(0.5) {
+    if method == CornerMethod::EdgeGeom {
         edges.clear();
     }
     // the degeneracy fix: processed corner vertices at the filleted vertex
@@ -2233,9 +2669,15 @@ fn gen_corner(rng: &mut Rng) -> Inputs {
         Vec::new()
     };
     let queries: Vec<usize> = if nf > 0 {
-        (0..rng.below(3))
+        let mut q: Vec<usize> = (0..rng.below(3))
             .map(|_| rng.below(nf as u64) as usize)
-            .collect()
+            .collect();
+        // an ExtSurface case with no query compares an empty record on both sides;
+        // query face 0 instead (no extra rng draw, so the stream is unchanged)
+        if q.is_empty() {
+            q.push(0);
+        }
+        q
     } else {
         Vec::new()
     };
@@ -2243,6 +2685,18 @@ fn gen_corner(rng: &mut Rng) -> Inputs {
         Some(model_gen_curve(rng, 3, scale))
     } else {
         None
+    };
+    let surfaces: Vec<Srf> = if matches!(method, CornerMethod::MakeFace | CornerMethod::Insert) {
+        (0..rng.below(4))
+            .map(|_| super::blend_fillet_geom_p1::gen_surface(rng, scale))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let fsgs: Vec<FsgIn> = if method == CornerMethod::ConstRad {
+        model.geoms.iter().map(|_| gen_fsg(rng)).collect()
+    } else {
+        Vec::new()
     };
     Inputs::Corner {
         method,
@@ -2278,12 +2732,343 @@ fn gen_corner(rng: &mut Rng) -> Inputs {
         squeeze,
         curve,
         topo,
+        surfaces,
+        fsgs,
     }
+}
+
+/// A random solver generator for a `const_rad` case (mostly circular).
+fn gen_fsg(rng: &mut Rng) -> FsgIn {
+    let kind = *rng
+        .choose(&[0, 0, 0, 1, 1, 2, 3, 4, -1])
+        .unwrap_or(&0);
+    FsgIn {
+        kind,
+        scale: *rng.choose(&[1.5, 1.5, 1.0, 2.0]).unwrap_or(&1.5),
+        continuity: rng.below(3) as u32,
+    }
+}
+
+/// A corner on a hand-built model for one of the face or fillet routines.
+fn corner_on(method: CornerMethod, model: Model, corner: CornerIn) -> Inputs {
+    Inputs::Corner {
+        method,
+        model: Box::new(model),
+        corner: Box::new(corner),
+        peek: PeekIn::default(),
+        solvers: Vec::new(),
+        query: 0,
+        adds: Vec::new(),
+        queries: Vec::new(),
+        squeeze: 0,
+        curve: None,
+        topo: Vec::new(),
+        surfaces: Vec::new(),
+        fsgs: Vec::new(),
+    }
+}
+
+/// The corner record of a hand-built corner over model vertices `verts` and edges
+/// `edges`.
+fn plain_corner(kind: usize, verts: Vec<usize>, edges: Vec<usize>, tol: f64) -> CornerIn {
+    CornerIn {
+        kind,
+        v_edge: -1,
+        v_sub: 0,
+        solver: None,
+        all: None,
+        verts,
+        edges,
+        bevel: false,
+        blending: false,
+        chamfer: false,
+        degenerate: false,
+        ext: true,
+        adjusted: false,
+        setback: 0.0,
+        tol,
+        tan: 0.01,
+        orig_faces: Vec::new(),
+    }
+}
+
+fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn scale3(a: [f64; 3], s: f64) -> [f64; 3] {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+
+/// `MakeFaceBrep` on a planar polygon corner: three to five line edges chained on a
+/// plane (either way round), the plane as the one surface; sometimes a vertex moved
+/// off the plane or out of the loop, sometimes several B-spline surfaces (the
+/// N-sided branch) or none.
+fn gen_face_corner(rng: &mut Rng) -> Inputs {
+    use super::blend_fillet_corner_p3::{edge_in, line, plane_srf, vin};
+    let scale = *rng.choose(&[1.0, 1.0, 1e-3, 1e3, 0.1]).unwrap_or(&1.0);
+    let o = rng.point3(-scale, scale);
+    let a = rng.uniform(0.0, std::f64::consts::TAU);
+    let tilt = rng.uniform(-0.5, 0.5);
+    let u = [a.cos(), a.sin(), 0.0];
+    let v = [-a.sin() * tilt.cos(), a.cos() * tilt.cos(), tilt.sin()];
+    let n = 3 + rng.below(3) as usize;
+    let ccw = rng.chance(0.5);
+    let mut pts: Vec<[f64; 3]> = (0..n)
+        .map(|i| {
+            let t = std::f64::consts::TAU * i as f64 / n as f64 + rng.uniform(-0.2, 0.2);
+            let t = if ccw { t } else { -t };
+            let r = scale * rng.uniform(0.5, 1.0);
+            add3(o, add3(scale3(u, r * t.cos()), scale3(v, r * t.sin())))
+        })
+        .collect();
+    if rng.chance(0.1) {
+        if let Some(p) = pts.get_mut(0) {
+            let w = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+            *p = add3(*p, scale3(w, scale * *rng.choose(&[1e-3, 0.3]).unwrap_or(&0.3)));
+        }
+    }
+    let mut model = super::blend_fillet_geom_p4::empty_model();
+    model.vertices = pts.iter().map(|&p| vin(p, 0)).collect();
+    let etype = *rng.choose(&[1, 5, 9, 11]).unwrap_or(&1);
+    model.edges = (0..n)
+        .map(|i| {
+            let (a, b) = (i, (i + 1) % n);
+            let at = |k: usize| pts.get(k).copied().unwrap_or_default();
+            edge_in(a, b, etype, Some(line(at(a), at(b))), [-1, -1])
+        })
+        .collect();
+    let mut edges: Vec<usize> = (0..n).collect();
+    if rng.chance(0.1) {
+        edges.swap(0, 1);
+    }
+    let surfaces: Vec<Srf> = match rng.below(10) {
+        0 => Vec::new(),
+        1 | 2 => (0..2 + rng.below(2))
+            .map(|_| super::blend_fillet_geom_p1::gen_surface(rng, scale))
+            .collect(),
+        _ => {
+            let d = 4.0 * scale;
+            vec![plane_srf(
+                add3(o, scale3(add3(u, v), -2.0 * scale)),
+                scale3(u, d),
+                scale3(v, d),
+            )]
+        }
+    };
+    let tol = scale * *rng.choose(&[1e-6, 1e-3]).unwrap_or(&1e-6);
+    let kind = rng.below(11) as usize;
+    let mut i = corner_on(
+        CornerMethod::MakeFace,
+        model,
+        plain_corner(kind, (0..n).collect(), edges, tol),
+    );
+    if let Inputs::Corner { surfaces: s, .. } = &mut i {
+        *s = surfaces;
+    }
+    i
+}
+
+/// A rational quarter circle from `c + r a` to `c + r b` (`a`, `b` orthonormal).
+fn quarter_arc(c: [f64; 3], r: f64, a: [f64; 3], b: [f64; 3]) -> Crv {
+    let w = std::f64::consts::FRAC_1_SQRT_2;
+    let p0 = add3(c, scale3(a, r));
+    let p1 = add3(c, scale3(add3(a, b), r));
+    let p2 = add3(c, scale3(b, r));
+    Crv {
+        dim: 3,
+        cpts: vec![
+            [p0[0], p0[1], p0[2], 1.0],
+            [p1[0] * w, p1[1] * w, p1[2] * w, w],
+            [p2[0], p2[1], p2[2], 1.0],
+        ],
+        p: 2,
+        u: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+    }
+}
+
+/// The quarter cylinder of radius `r` about the axis through `c` along `axis`, from
+/// direction `a` to `b`, `len` either side of `c`.
+fn quarter_cylinder(c: [f64; 3], r: f64, a: [f64; 3], b: [f64; 3], axis: [f64; 3], len: f64) -> Srf {
+    let w = std::f64::consts::FRAC_1_SQRT_2;
+    let ring = [(a, 1.0), (add3(a, b), w), (b, 1.0)];
+    let net = ring
+        .iter()
+        .map(|&(d, wt)| {
+            [-len, len]
+                .iter()
+                .map(|&t| {
+                    let p = add3(add3(c, scale3(d, r)), scale3(axis, t));
+                    [p[0] * wt, p[1] * wt, p[2] * wt, wt]
+                })
+                .collect()
+        })
+        .collect();
+    Srf {
+        net,
+        p: 2,
+        q: 1,
+        u: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        v: vec![0.0, 0.0, 1.0, 1.0],
+    }
+}
+
+/// `MakeConstantRadiusFillet` on a spherical three-sided corner: three quarter-circle
+/// cross sections (`A -> B -> C -> A` about a common centre, radii perturbed now and
+/// then), the second and third carrying fillet geometries whose surfaces are the quarter
+/// cylinders through them; solvers of random generators; sometimes an edge that is not
+/// a cross section, a line instead of an arc, or a geometry without surface.
+fn gen_const_rad_corner(rng: &mut Rng) -> Inputs {
+    use super::blend_fillet_corner_p3::{edge_in, line, vin};
+    use super::blend_fillet_geom_p1::GeomIn;
+    let scale = *rng.choose(&[1.0, 1.0, 1e-2, 1e2]).unwrap_or(&1.0);
+    let c = rng.point3(-scale, scale);
+    let r = scale * rng.uniform(0.2, 1.0);
+    let (x, y, z) = ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+    let rr = |rng: &mut Rng| {
+        if rng.chance(0.15) {
+            r * rng.uniform(0.9, 1.1)
+        } else {
+            r
+        }
+    };
+    let (ra, rb, rc) = (rr(rng), rr(rng), rr(rng));
+    let pa = add3(c, scale3(x, r));
+    let pb = add3(c, scale3(y, r));
+    let pc = add3(c, scale3(z, r));
+    let mut model = super::blend_fillet_geom_p4::empty_model();
+    model.vertices = vec![vin(pa, 0), vin(pb, 0), vin(pc, 0)];
+    let arcs = [
+        quarter_arc(c, ra, x, y),
+        quarter_arc(c, rb, y, z),
+        quarter_arc(c, rc, z, x),
+    ];
+    // the fillet surfaces of the cross sections B -> C (about x) and C -> A (about y)
+    let len = 2.0 * r;
+    let mut geoms = vec![
+        GeomIn {
+            gtype: 0,
+            status: 0,
+            center: None,
+            surface: Some(quarter_cylinder(c, r, y, z, x, len)),
+            rails: [-1, -1],
+            other1: Vec::new(),
+            other2: Vec::new(),
+            sides: Vec::new(),
+        },
+        GeomIn {
+            gtype: 0,
+            status: 0,
+            center: None,
+            surface: Some(quarter_cylinder(c, r, z, x, y, len)),
+            rails: [-1, -1],
+            other1: Vec::new(),
+            other2: Vec::new(),
+            sides: Vec::new(),
+        },
+    ];
+    if rng.chance(0.05) {
+        if let Some(g) = geoms.get_mut(0) {
+            g.surface = None;
+        }
+    }
+    model.geoms = geoms;
+    let etype = |rng: &mut Rng| if rng.chance(0.05) { 9 } else { 1 };
+    let ends = [(pa, pb, 0, 1), (pb, pc, 1, 2), (pc, pa, 2, 0)];
+    let gs = [[-1, -1], [0, -1], [1, -1]];
+    model.edges = arcs
+        .iter()
+        .zip(ends)
+        .zip(gs)
+        .map(|((arc, (p, q, a, b)), g)| {
+            let crv = if rng.chance(0.05) {
+                line(p, q)
+            } else {
+                arc.clone()
+            };
+            edge_in(a, b, etype(rng), Some(crv), g)
+        })
+        .collect();
+    let mut edges = vec![0, 1, 2];
+    edges.rotate_left(rng.below(3) as usize);
+    if rng.chance(0.05) {
+        edges.pop();
+    }
+    let tol = scale * *rng.choose(&[1e-3, 1e-5]).unwrap_or(&1e-3);
+    let mut i = corner_on(
+        CornerMethod::ConstRad,
+        model,
+        plain_corner(rng.below(11) as usize, vec![0, 1, 2], edges, tol),
+    );
+    let fsg = gen_fsg(rng);
+    let other = if rng.chance(0.8) { fsg.clone() } else { gen_fsg(rng) };
+    if let Inputs::Corner { fsgs, .. } = &mut i {
+        *fsgs = vec![fsg, other];
+    }
+    i
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    /// Prints the face / fillet corner fixtures (`fixtures/blend.fillet_corner_p1/faces.json`).
+    #[test]
+    #[ignore = "writes fixture JSON to stdout"]
+    fn dump_face_fixtures() {
+        let mut cases = Vec::new();
+        for i in 0..40u64 {
+            let mut rng = Rng::new(0xface_0000 + i);
+            cases.push(json!({"name": format!("make_face_{i:02}"), "upstream_ref": "source/SMLib/src/SmFilletCorner.cpp:3687 (MakeFaceBrep)", "inputs": gen_face_corner(&mut rng)}));
+        }
+        for i in 0..40u64 {
+            let mut rng = Rng::new(0xc0de_0000 + i);
+            cases.push(json!({"name": format!("const_rad_{i:02}"), "upstream_ref": "source/SMLib/src/SmFilletCorner.cpp:3034 (MakeConstantRadiusFillet)", "inputs": gen_const_rad_corner(&mut rng)}));
+        }
+        let mut n = 0;
+        let mut seed = 0x1e5e_0000u64;
+        while n < 30 {
+            seed += 1;
+            let mut rng = Rng::new(seed);
+            let i = gen_corner(&mut rng);
+            let Inputs::Corner { method, .. } = &i else { continue };
+            if matches!(method, CornerMethod::Insert | CornerMethod::EndPatch | CornerMethod::MakeFace) {
+                cases.push(json!({"name": format!("corner_{method:?}_{n:02}").to_lowercase(), "upstream_ref": "source/SMLib/src/SmFilletCorner.cpp (CreateEndPatch, MakeFaceBrep, InsertIntersectionTopology on random models)", "inputs": i}));
+                n += 1;
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&json!({"cases": cases})).unwrap());
+    }
+
+    /// Prints the blending insertion fixtures
+    /// (`fixtures/blend.fillet_corner_p1/insert_blending.json`): blending corners at a
+    /// vertex of a target face with corner surfaces, so `InsertIntersectionTopology`
+    /// registers each vertex face with each surface (`RegisterExistingSSI`).
+    #[test]
+    #[ignore = "writes fixture JSON to stdout"]
+    fn dump_insert_blending_fixtures() {
+        let mut cases = Vec::new();
+        let mut seed = 0xb1e0_0000u64;
+        while cases.len() < 24 {
+            seed += 1;
+            let mut rng = Rng::new(seed);
+            let mut i = gen_corner(&mut rng);
+            let Inputs::Corner { method, model, corner, surfaces, .. } = &mut i else { continue };
+            if *method != CornerMethod::Insert || model.faces.is_empty() {
+                continue;
+            }
+            corner.blending = true;
+            corner.v_edge = -2 - rng.below(model.faces.len() as u64) as i64;
+            corner.v_sub = rng.below(2) as usize;
+            while surfaces.len() < 1 + rng.below(3) as usize {
+                surfaces.push(super::super::blend_fillet_geom_p1::gen_surface(&mut rng, 1.0));
+            }
+            let n = cases.len();
+            cases.push(json!({"name": format!("insert_blending_{n:02}"), "upstream_ref": "source/SMLib/src/SmFilletCorner.cpp:2353 (InsertIntersectionTopology: RegisterExistingSSI of each vertex face with each corner surface)", "inputs": i}));
+        }
+        println!("{}", serde_json::to_string_pretty(&json!({"cases": cases})).unwrap());
+    }
 
     #[test]
     fn inputs_round_trip() {
@@ -2368,7 +3153,7 @@ mod tests {
                     // selectors
                     let mut resolved = String::new();
                     if let Ok(i) = serde_json::from_value::<Inputs>(case.inputs.clone()) {
-                        if let Ok(Ok(t)) = topo(&i) {
+                        if let Ok(Ok(t)) = topo(&i, true) {
                             let vid = t.args.first().and_then(|&v| u32::try_from(v).ok());
                             let ring: Vec<u32> = t
                                 .brep

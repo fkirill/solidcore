@@ -1,12 +1,12 @@
 //! `SmSurfaceIntersector`, part 5: the top level surface/surface intersection
-//! ([`AdvSurfaceIntersector::do_intersection`]) and its grazing-box shortcut
+//! ([`do_intersection`]) and its grazing-box shortcut
 //! ([`SurfaceIntersector::grazing_box_process`]).
 //!
 //! Upstream: `source/SMLib/src/SmSurfaceIntersector.cpp`.
 //!
 //! | Rust                                                  | Upstream                      |
 //! |-------------------------------------------------------|-------------------------------|
-//! | [`AdvSurfaceIntersector::do_intersection`], [`AdvSurfaceIntersector::do_intersection_with_caches`] | `DoIntersection` |
+//! | [`do_intersection`], [`AdvSurfaceIntersector::do_intersection_with_caches`] | `DoIntersection` |
 //! | [`intersection_surface_caches`], [`IntersectionSurface`] | the `smsurf_GetSurfaceCache` / `GetTree` calls at the top of `DoIntersection` |
 //! | [`SurfaceIntersector::grazing_box_process`], [`GrazingBox`] | `GrazingBoxProcess`     |
 //!
@@ -24,7 +24,7 @@
 //!   [`AdvSurfaceIntersector::new`] sets.
 //! - **Surface caches.** Rust surfaces keep no cache, so the caller hands the caches
 //!   in ([`intersection_surface_caches`] builds them as `smsurf_GetSurfaceCache` /
-//!   `GetTree` would; [`AdvSurfaceIntersector::do_intersection`] does both). One
+//!   `GetTree` would; [`do_intersection`] does both). One
 //!   cache per surface, one for a self intersection (upstream gets the same cache
 //!   twice). The temporary flags (`m_bPointTestEnabled = FALSE`,
 //!   `m_bProcessBoundaryCurves = TRUE`) are set before the first solve rather than
@@ -50,6 +50,12 @@
 //! - **Bounded loops.** The start point loop pops one start point per pass; no pass
 //!   adds start points (`TraceCurve` adds none), so it ends after at most as many
 //!   passes as `FindBoundaryStartPoints` made points.
+//! - **Opt-in fix (WR-76, #392).** With
+//!   [`UpstreamFixes::ssi_trace_tangent_curves_once`](crate::kernel::UpstreamFixes::ssi_trace_tangent_curves_once)
+//!   a traced curve removes, before it is flushed, the start points left in a tangent
+//!   cluster with either of its ends (`SurfaceIntersector::remove_end_tangent_clusters`);
+//!   the SolidCraft fork's tangency-labs/smlib@0ce09f2. Off by default (upstream
+//!   behaviour).
 //! - **Not ported here.** The `SM_DEBUG_CODE` blocks (graphics, dumps, the start
 //!   point reordering experiment), `SmCacheCheckOutIn` (the caches are owned by the
 //!   caller), the unused context argument and the `SM_ASSERT`s.
@@ -72,6 +78,7 @@ use crate::nurbs::knots::Side;
 use crate::surface::surface::p1::SurfaceSolveContext;
 use crate::surface::surface::p2::{surface_cache, SurfaceIntersection, TsectCurveType};
 use crate::surface::surface::Surface;
+use crate::surface::surface_cache::face_context::FaceQueries;
 use crate::surface::surface_cache::p1::{PatchBoundaryBoundingPlanes, SurfaceCache};
 
 use super::p1::{SrfIndex, SurfaceIntersector, TsectPnt};
@@ -146,12 +153,17 @@ fn intersection_surface_caches_in<O: Copy + PartialEq>(
     };
     let [h1, h2] = handles;
     let mut get = |s, h| -> Result<SurfaceCache<O>> {
-        let built = match context.as_mut() {
-            Some(ctx) => ctx.build_surface_cache(k, s, h),
-            None => surface_cache::<O>(k, s, h),
+        let (built, from_context) = match context.as_mut() {
+            Some(ctx) => (ctx.build_surface_cache(k, s, h), true),
+            None => (surface_cache::<O>(k, s, h), false),
         };
         let mut c = built.map_err(ner)?;
-        c.get_tree(k).map_err(ner)?;
+        // A context builds the cache with its tree ready (`GetTree` through the face
+        // that owns the surface, `SurfaceSolveContext::build_surface_cache`): calling
+        // `GetTree` again here, in the same state, would rebuild the same tree.
+        if !(from_context && c.tree().is_some()) {
+            c.get_tree(k).map_err(ner)?;
+        }
         Ok(c)
     };
     let mut caches = vec![get(si.surface(SrfIndex::First), h1)?];
@@ -381,7 +393,14 @@ pub fn do_intersection_with_context<O: SolutionObject + Copy + PartialEq>(
     ssi.base
         .set_use_surface_edges(use_surface_edges[0], use_surface_edges[1]);
     caches = intersection_surface_caches_with_context(k, &ssi.base, handles, context)?;
-    ssi.do_intersection_with_caches(k, &mut caches, opt_approx_tol_3d, opt_ang_tol_rad)
+    ssi.do_intersection_in(
+        k,
+        &mut caches,
+        opt_approx_tol_3d,
+        opt_ang_tol_rad,
+        context.face_queries(),
+        true,
+    )
 }
 
 impl<'t, O: SolutionObject + Copy + PartialEq + 't> AdvSurfaceIntersector<'_, 't, O> {
@@ -429,7 +448,59 @@ impl<'t, O: SolutionObject + Copy + PartialEq + 't> AdvSurfaceIntersector<'_, 't
         opt_approx_tol_3d: Option<f64>,
         opt_ang_tol_rad: Option<f64>,
     ) -> Result<SurfaceIntersection> {
+        self.do_intersection_with_caches_and_queries(
+            k,
+            caches,
+            opt_approx_tol_3d,
+            opt_ang_tol_rad,
+            None,
+        )
+    }
+
+    /// [`AdvSurfaceIntersector::do_intersection_with_caches`] with the face
+    /// classifications of the context that made the caches: the boundary start
+    /// points' solves on a face's trimmed cache classify on that face
+    /// ([`SurfaceIntersector::find_boundary_start_points_with_queries`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`AdvSurfaceIntersector::do_intersection_with_caches`].
+    pub fn do_intersection_with_caches_and_queries(
+        &mut self,
+        k: &Kernel,
+        caches: &'t mut [SurfaceCache<O>],
+        opt_approx_tol_3d: Option<f64>,
+        opt_ang_tol_rad: Option<f64>,
+        queries: Option<&dyn FaceQueries<O>>,
+    ) -> Result<SurfaceIntersection> {
+        self.do_intersection_in(
+            k,
+            caches,
+            opt_approx_tol_3d,
+            opt_ang_tol_rad,
+            queries,
+            false,
+        )
+    }
+
+    /// [`AdvSurfaceIntersector::do_intersection_with_caches_and_queries`]; with
+    /// `trees_ready` the caches came from a face-aware context with their trees ready
+    /// (`GetTree` just ran through their faces), so a cache with a tree is not asked
+    /// for it again: in the same state that `GetTree` would rebuild the same tree, and
+    /// the two flags its rebuild sets are overwritten below.
+    #[allow(clippy::too_many_lines)] // one upstream function
+    fn do_intersection_in(
+        &mut self,
+        k: &Kernel,
+        caches: &'t mut [SurfaceCache<O>],
+        opt_approx_tol_3d: Option<f64>,
+        opt_ang_tol_rad: Option<f64>,
+        queries: Option<&dyn FaceQueries<O>>,
+        trees_ready: bool,
+    ) -> Result<SurfaceIntersection> {
         let mut result = SurfaceIntersection::default();
+        // filled by FindInteriorCurves, read by the tangential curve pass (WR-75)
+        self.tangent_curve_seeds.clear();
 
         if let Some(t) = opt_approx_tol_3d {
             self.base.this_approx_tol_3d = t;
@@ -444,13 +515,15 @@ impl<'t, O: SolutionObject + Copy + PartialEq + 't> AdvSurfaceIntersector<'_, 't
             return Err(SolidError::null_pointer(OP_DI));
         }
         for c in caches.iter_mut().take(2) {
-            c.get_tree(k).map_err(|e| {
-                if e.is_unported() {
-                    e
-                } else {
-                    SolidError::null_pointer(OP_DI)
-                }
-            })?;
+            if !(trees_ready && c.tree().is_some()) {
+                c.get_tree(k).map_err(|e| {
+                    if e.is_unported() {
+                        e
+                    } else {
+                        SolidError::null_pointer(OP_DI)
+                    }
+                })?;
+            }
 
             // Turn off point testing so GlobalPointSolve() keeps all point solutions;
             // turn on boundary curve processing so LocalSolve looks for drop points on
@@ -474,7 +547,7 @@ impl<'t, O: SolutionObject + Copy + PartialEq + 't> AdvSurfaceIntersector<'_, 't
         let caches: &'t [SurfaceCache<O>] = caches;
         let cache1 = caches.first().ok_or(SolidError::null_pointer(OP_DI))?;
         let cache2 = caches.get(1).unwrap_or(cache1);
-        self.set_surface_caches(cache1, cache2)?;
+        self.bind_caches(cache1, cache2)?;
 
         // no work - root treeNode bounding boxes are disjoint
         let root_box = |c: &SurfaceCache<O>| -> Result<Extent3d> {
@@ -585,14 +658,19 @@ impl<'t, O: SolutionObject + Copy + PartialEq + 't> AdvSurfaceIntersector<'_, 't
         }
 
         // get StartPoints = Surf1->NaturalBoundaryCurve/Surf2 Intersections and
-        // Surf1/Surf2->NaturalBoundaryCurve Intersections (on copies of the caches)
+        // Surf1/Surf2->NaturalBoundaryCurve Intersections (on copies of the caches:
+        // exact ones, since upstream searches its own caches)
         if !self.base.doing_self_intersection {
-            let mut boundary_caches = caches.to_vec();
-            self.base.find_boundary_start_points_with_caches(
+            let mut boundary_caches = caches
+                .iter()
+                .map(SurfaceCache::clone_for_evaluation)
+                .collect::<Result<Vec<_>>>()?;
+            self.base.find_boundary_start_points_with_queries(
                 k,
                 &mut boundary_caches,
                 &bbox,
                 &mut out,
+                queries,
             )?;
         }
 
@@ -621,7 +699,13 @@ impl<'t, O: SolutionObject + Copy + PartialEq + 't> AdvSurfaceIntersector<'_, 't
                         && (sp.v_param_type(srf) == ExtentPointType::Inside
                             || is_zero_to_tol(sp.uv_deriv(srf).y, EFF_ZERO))
                 };
-                if !self.base.curve_is_closed
+                // (opt-in, WR-80: a trace that added no point, its start already on a
+                // found curve, has nothing to trace back from; upstream reverses the empty
+                // list and fails with SM_ERR_NULL_POINTER)
+                let traced =
+                    !k.fixes.ssi_no_reverse_of_empty_trace || !self.base.curve_points.is_empty();
+                if traced
+                    && !self.base.curve_is_closed
                     && input_trace_direction == self.base.curve_trace_direction
                     && along(SrfIndex::First)
                     && along(SrfIndex::Second)
@@ -634,6 +718,13 @@ impl<'t, O: SolutionObject + Copy + PartialEq + 't> AdvSurfaceIntersector<'_, 't
                     // restore the curve direction (upstream multiplies by 1.0)
                     self.base.curve_trace_direction *= 1.0;
                     self.base.reverse_curve_direction()?;
+                }
+
+                // opt-in fix (WR-76, #392): a traced curve that ends on a boundary
+                // inside a tangential contact consumes the start points of that
+                // contact's boundary cluster
+                if k.fixes.ssi_trace_tangent_curves_once {
+                    self.base.remove_end_tangent_clusters(k)?;
                 }
 
                 // create the curves from the points in m_vCurvePoints
@@ -656,6 +747,44 @@ impl<'t, O: SolutionObject + Copy + PartialEq + 't> AdvSurfaceIntersector<'_, 't
             deviations: core::mem::take(&mut out.deviations),
         };
         self.find_interior_curves(k, &mut interior)?;
+
+        // not upstream (WR-75, opt-in; the fork's FindTangentCurves): trace the
+        // tangential curves the marcher above cannot follow
+        let mut tangent_nodes = Vec::new();
+        if k.fixes.ssi_tangent_curve_tracer {
+            let size = crate::math::min2(root1.size().length(), root2.size().length());
+            let seeds = core::mem::take(&mut self.tangent_curve_seeds);
+            let mut curves = TsectCurves {
+                curves_3d: core::mem::take(&mut interior.curves_3d),
+                uv_curves: [
+                    core::mem::take(&mut interior.surface1_uv_curves),
+                    core::mem::take(&mut interior.surface2_uv_curves),
+                ],
+                curve_types: core::mem::take(&mut interior.curve_types),
+                deviations: core::mem::take(&mut interior.deviations),
+            };
+            let traced = super::tangent_curves::find_tangent_curves(
+                k,
+                &mut self.base,
+                size,
+                &seeds,
+                &mut curves,
+            );
+            let TsectCurves {
+                curves_3d,
+                uv_curves: [surface1_uv_curves, surface2_uv_curves],
+                curve_types,
+                deviations,
+            } = curves;
+            interior = InteriorCurves {
+                curves_3d,
+                surface1_uv_curves,
+                surface2_uv_curves,
+                curve_types,
+                deviations,
+            };
+            tangent_nodes = traced?;
+        }
         let InteriorCurves {
             mut curves_3d,
             mut surface1_uv_curves,
@@ -693,6 +822,21 @@ impl<'t, O: SolutionObject + Copy + PartialEq + 't> AdvSurfaceIntersector<'_, 't
                 }
             }
             ii += 1;
+        }
+
+        // not upstream (WR-75, opt-in; the fork's AddTangentNodes): report the singular
+        // points where crossing branches meet
+        if k.fixes.ssi_tangent_curve_tracer {
+            super::tangent_curves::add_tangent_nodes(
+                k,
+                &self.base,
+                &tangent_nodes,
+                &mut curves_3d,
+                &mut surface1_uv_curves,
+                &mut surface2_uv_curves,
+                &mut curve_types,
+                &mut deviations,
+            )?;
         }
 
         // set outputs

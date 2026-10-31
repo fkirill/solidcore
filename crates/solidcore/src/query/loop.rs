@@ -33,8 +33,9 @@
 //!   reached when the point lies on a side of the surface's natural domain and an edge
 //!   use end of the loop does too.
 //! - **Ignored statuses.** Upstream ignores the status of `EvaluatePoint` /
-//!   `Evaluate` of the surface and the trim curves and then reads the (uninitialised)
-//!   outputs; the port returns their error instead (no valid input reaches it).
+//!   `Evaluate` of the surface and the trim curves and then reads the outputs they did
+//!   not write (`SM_UNDEF_DOUBLE` defaults, or the previous step's derivatives); the
+//!   port returns their error instead (no valid input reaches it).
 //!   `DropPoint` and `LocalPointSolve` failures are "no answer" (both reset their
 //!   success flag first upstream). [`SolidError::Unported`] from any callee is
 //!   returned.
@@ -278,7 +279,7 @@ pub(crate) fn contains_uv_point_with_topology(
     // upstream), so the face's tolerance
     let zone_tol = face_rec.tolerance;
 
-    let srf_uv_domain = surface.natural_uv_domain();
+    let srf_uv_domain = surface.natural_uv_domain_with_nurb(k)?;
     let point_3d = surface.evaluate_point(k, uv)?;
     let uv_pt = Point3::new(uv.x, uv.y, 0.0);
 
@@ -375,11 +376,16 @@ pub(crate) fn contains_uv_point_with_topology(
         // low work: see if TgtPoint is on this EdgeCurve
         let on_edge_curve = {
             let edge = b.edge(this_edge)?;
-            let curve = edge
+            // the drop builds the edge curve's cache at the edge's tolerance
+            // (SmTol::GetApproxTol3d(&m_crCurve) reads pEdge->GetTolerance() through the
+            // owner)
+            let mut curve = edge
                 .curve
                 .as_ref()
-                .ok_or_else(|| null("ContainsUVPoint: edge without curve"))?;
-            drop_on_edge(k, curve, &edge.interval, point_3d, edge.tolerance)?
+                .ok_or_else(|| null("ContainsUVPoint: edge without curve"))?
+                .clone_for_evaluation()?;
+            curve.set_owner_zone_tol_3d(Some(edge.tolerance));
+            drop_on_edge(k, &curve, &edge.interval, point_3d, edge.tolerance)?
         };
         if let Some(param) = on_edge_curve {
             // TgtPoint is on EdgeCurve - set output and return

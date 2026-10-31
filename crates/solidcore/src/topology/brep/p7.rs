@@ -23,8 +23,9 @@
 //!   [`BrepData::read_from_file`] (unit `topology.brep_data`), which bounds every count it
 //!   reads and the nesting of its polymorphic readers (AGENTS.md section 1).
 //! - **Arena records.** `GlueEdgesGeneral` destroys the deleted edge's stable arena
-//!   record after its last edgeuse pair moves. Other plain `delete`s of edge uses,
-//!   vertex uses, shells and regions unlink the record (it stays as an orphan).
+//!   record after its last edgeuse pair moves, and the shell it merges away
+//!   (`delete pDelShell`). Other plain `delete`s of edge uses, vertex uses and regions
+//!   unlink the record (it stays as an orphan).
 //!   `m_pEdgeListHead->Remove` takes the edge off [`Brep::edge_list`] before the
 //!   transfers begin. The owning-list edits
 //!   `SmEdge::Remove(eu)`, `SmVertex::Remove(vu)`, `SmRegion::Remove(shell)` and
@@ -62,13 +63,24 @@
 //!   (`topology.brep_p4`). `GlueVertices` calls `topology.brep_p5` with the caller's
 //!   notification environment. `CopyFaces` with the merge builds `boolean.merge_p2`'s
 //!   merge and calls its `MakeFaceuse` (so it takes the kernel mutably, for the
-//!   context's `DoingBoolean`); its copies are notified in `env`'s one identity space.
+//!   context's `DoingBoolean`). (not upstream: upstream's objects are their own
+//!   identities) `CopyFaces` names the copies by `env.key_of` (`this_face` for faces)
+//!   and the source by `env.key_of` too, or by its own naming in [`copy_faces_from`];
+//!   two namings that coincide on the source's objects name the source in a private
+//!   domain for the copy, and are refused where a source object's attribute list is on
+//!   a key the copies' naming gives out (the copies would share it).
 //!   `MergeSelfIntersectionCurves` classifies each UV curve with
 //!   `intersect.curve_class_p4`'s constructor and `query.face_p2`'s `CurveOnClassify`,
 //!   then `intersect.curve_class_p1`'s `SetCurve` and `intersect.curve_class_p5`'s
 //!   `MergeIntervals`, over `topology.face_p3`'s [`IntersectObject`] handles (the merge's
 //!   curve `i` is `Curve(i)`, its UV curves `UvCurve(i, false / true)`, the surface
-//!   `Surface(face)`); their unported callees defer the call. The classification's
+//!   `Surface(face)`); their unported callees defer the call. The merges run
+//!   `merge_intervals_mut` over the B-rep (upstream edits it through the
+//!   classification's topology pointers), so `MergeIntoObject` makes its vertex loops,
+//!   edge splits and edges in `b`; the caller's `curve_ref` names the curves of split
+//!   edges in the notifications. The 3D curves are the call's copies of the caller's
+//!   (`SetXSectCurveThroughPoint` edits those copies, not the caller's values, which
+//!   are borrowed shared). The classification's
 //!   borrowed interval array is not modelled (`lOptDataSize = 16` is passed through). The
 //!   upstream interval loop around them is ported (`GetSize() != 1` skips before the
 //!   second merge, `SM_ERR` after it, `SE(SM_ERR)` for a middle not on an edge).
@@ -81,8 +93,16 @@
 //!   `MakeFaceTopology` names the face by the notification environment's identity
 //!   and builds it on a copy of the surface (with no surface identity: its owner
 //!   changes are not notified), which `MakeFace` then replaces with its own
-//!   (upstream: one shared surface whose owner `MakeFace` restores). It claims its
+//!   (upstream: one shared surface whose owner `MakeFace` restores). The copy shares
+//!   the original's cache slot, so a surface cache built while making the face stays
+//!   with the installed surface as upstream's does. It claims its
 //!   marks through a fresh [`Marks`] record per call, as each call takes a new mark.
+//! - **Original-surface transfer ownership (#894).** Deliberately correcting pinned
+//!   C++ `SmBrep.cpp:18859-18889`, the original-transfer path never restores the old
+//!   owner after installation, even on a late failure. The installed original keeps
+//!   its identity and partial topology; its owner, geometry-owner registration and
+//!   cached tolerance agree with the installed face before returning the failure.
+//!   The legacy-copy path retains upstream's owner-restoration behavior.
 //! - **`MakeFace`** returns nothing when `MakeFaceTopology` fails; upstream still hands
 //!   back the region and shell it may have made (`MakeFaceWithCurves` warns about it).
 //! - **`GlueEdgesGeneral`**: the arena cannot share one curve between two edges, so
@@ -102,6 +122,7 @@ use crate::boolean::topology_intersector::p1::{Relations, TopologyIntersector};
 use crate::curve::crv_on_surf::CrvOnSurf;
 use crate::curve::curve::Curve;
 use crate::error::{ignore_status, ignored, EntityRef, Result, SolidError};
+use crate::geom::attribute::ObjectKey;
 use crate::geom::extent1d::Extent1d;
 use crate::geom::extent2d::Extent2d;
 use crate::geom::object::{NotifyOperation, ObjectRef};
@@ -111,7 +132,9 @@ use crate::geom::tools::{
 };
 use crate::intersect::curve_class::p1::{CurveClassification, CurveInterval};
 use crate::intersect::curve_class::p4::ClassificationInit;
-use crate::intersect::point_class::PointClassType;
+use crate::intersect::curve_class::p5::ClassGeometryMut;
+use crate::intersect::curve_class::p6::{MergeContext as ClassMergeContext, MergeIntervalBrep};
+use crate::intersect::point_class::{ClassGeometry, PointClassType};
 use crate::kernel::Kernel;
 use crate::math::{Point3, EFF_ZERO, EFF_ZERO_DEG, PI};
 use crate::nurbs::b_spline_curve::BSplineCurve;
@@ -119,6 +142,7 @@ use crate::nurbs::b_spline_curve_n_lib::InValueType;
 use crate::nurbs::b_spline_surface_n_lib::p2::OrientType;
 use crate::query::face::p2 as qf2;
 use crate::surface::surface::Surface;
+use crate::surface::volume::Volume;
 use crate::topology::brep::p1;
 use crate::topology::brep::p10::{self, MakeTopologyOptions, TopologyEnv};
 use crate::topology::brep::p2;
@@ -131,7 +155,9 @@ use crate::topology::edgeuse::p1 as eu1;
 use crate::topology::face::p2 as fp2;
 use crate::topology::face::p3::{IntersectObject, IntersectObjects};
 use crate::topology::topology_traverser::{self as tt, Marks};
-use crate::topology::{Brep, EdgeId, EdgeuseId, FaceId, FaceuseId, RegionId, ShellId, VertexId};
+use crate::topology::{
+    Brep, EdgeId, EdgeuseId, FaceId, FaceuseId, LoopId, RegionId, ShellId, VertexId, VertexuseId,
+};
 
 const OP: &str = "topology::brep::p7";
 
@@ -314,17 +340,6 @@ fn make_topology_from_data(
     r
 }
 
-/// `SmFace::Notify(op, data1, data2, data3)` on face `f` (`None` for a null datum or for
-/// the B-rep, which has no identity here).
-fn face_notify(
-    b: &mut Brep,
-    f: FaceId,
-    op: NotifyOperation,
-    data: [Option<EntityRef>; 3],
-) -> Result<()> {
-    crate::topology::loopuse::face_notify_data(b, f, op, data)
-}
-
 /// `SmFace::SetTolerance(tol, bUpdateOnlyIfLarger, bCascadeToBndries)` (`SM_USE_OLDTOL`).
 fn face_set_tolerance(
     b: &mut Brep,
@@ -429,7 +444,7 @@ type SelfClassification = CurveClassification<IntersectObject>;
 /// each of `faces` (the remaining arguments default).
 fn classify_on_faces(
     k: &Kernel,
-    objects: &IntersectObjects<'_>,
+    objects: &mut SelfMergeObjects<'_, '_>,
     faces: &[FaceId],
     face: FaceId,
     uv_curve: IntersectObject,
@@ -453,21 +468,166 @@ fn classify_on_faces(
         },
     )?;
     for &f in faces {
-        qf2::curve_on_classify(k, objects.b, f, objects, true, &mut cc, false, false, true)?;
+        qf2::curve_on_classify_mut(k, f, objects, true, &mut cc, false, false, true)?;
     }
     Ok(cc)
+}
+
+/// The objects of [`merge_self_intersection_curves`]' merges over the B-rep they edit:
+/// upstream's `MergeIntervals` edits the B-rep through the classification's `SmFace*`,
+/// `SmEdge*` and `SmVertex*` pointers (a vertex loop, an edge split, a new edge), and
+/// `SetXSectCurveThroughPoint` edits the merged 3D curve. The handles are those of
+/// [`IntersectObjects`] over one B-rep (side `false`).
+struct SelfMergeObjects<'a, 'e> {
+    b: &'a mut Brep,
+    curves_3d: &'a mut [Curve],
+    uv1: &'a [Option<Curve>],
+    uv2: &'a [Option<Curve>],
+    env: &'a mut ed::NotifyEnv<'e>,
+    curve_ref: &'a dyn Fn(EdgeId, i64) -> ObjectRef,
+}
+
+impl SelfMergeObjects<'_, '_> {
+    /// The read-only objects over the same B-rep and curves.
+    fn view(&self) -> IntersectObjects<'_> {
+        IntersectObjects {
+            b: &*self.b,
+            other: &*self.b,
+            side: false,
+            curves_3d: &*self.curves_3d,
+            uv1: self.uv1,
+            uv2: self.uv2,
+        }
+    }
+}
+
+impl ClassGeometry<IntersectObject> for SelfMergeObjects<'_, '_> {
+    fn classification_vertex_point(&self, o: IntersectObject) -> Option<Point3> {
+        self.view().classification_vertex_point(o)
+    }
+    fn topology_zone_tol_3d(&self, o: IntersectObject) -> Option<f64> {
+        self.view().topology_zone_tol_3d(o)
+    }
+    fn curve(&self, o: IntersectObject) -> Option<&Curve> {
+        self.view().object_curve(o)
+    }
+    fn surface(&self, o: IntersectObject) -> Option<&Surface> {
+        self.view().object_surface(o)
+    }
+    fn volume(&self, _o: IntersectObject) -> Option<&Volume> {
+        None
+    }
+    fn point(&self, _o: IntersectObject) -> Option<Point3> {
+        None
+    }
+    fn topology_entity(&self, o: IntersectObject) -> Option<(&Brep, EntityRef)> {
+        self.view().object_entity(o)
+    }
+    fn topology_handle(&self, e: EntityRef) -> Option<IntersectObject> {
+        self.view().topology_handle(e)
+    }
+    fn topology_handle_in(&self, brep: &Brep, e: EntityRef) -> Option<IntersectObject> {
+        self.view().topology_handle_in(brep, e)
+    }
+}
+
+impl ClassGeometryMut<IntersectObject> for SelfMergeObjects<'_, '_> {
+    fn curve_mut(&mut self, o: IntersectObject) -> Option<&mut Curve> {
+        match o {
+            IntersectObject::Curve(i) => self.curves_3d.get_mut(i),
+            _ => None,
+        }
+    }
+    fn topology_entity_mut(&mut self, o: IntersectObject) -> Option<(&mut Brep, EntityRef)> {
+        match o {
+            // (both sides name this one B-rep)
+            IntersectObject::Topology(e, _) => Some((&mut *self.b, e)),
+            _ => None,
+        }
+    }
+}
+
+impl qf2::CurveOnClassifyObjects<IntersectObject> for SelfMergeObjects<'_, '_> {
+    fn face(&self, f: FaceId) -> IntersectObject {
+        self.view().face(f)
+    }
+    fn vertex(&self, v: VertexId) -> IntersectObject {
+        self.view().vertex(v)
+    }
+    fn edge(&self, e: EdgeId) -> IntersectObject {
+        self.view().edge(e)
+    }
+    fn vertexuse(&self, vu: VertexuseId) -> IntersectObject {
+        self.view().vertexuse(vu)
+    }
+    fn edgeuse(&self, eu: EdgeuseId) -> IntersectObject {
+        self.view().edgeuse(eu)
+    }
+    fn edge_curve(&self, e: EdgeId) -> IntersectObject {
+        self.view().edge_curve(e)
+    }
+    fn trim_curve(&self, eu: EdgeuseId) -> IntersectObject {
+        self.view().trim_curve(eu)
+    }
+    fn face_surface(&self, f: FaceId) -> Option<IntersectObject> {
+        self.view().face_surface(f)
+    }
+    fn loop_id(&self, tgt_loop: IntersectObject) -> Option<LoopId> {
+        self.view().loop_id(tgt_loop)
+    }
+}
+
+impl qf2::FaceBrep for SelfMergeObjects<'_, '_> {
+    fn brep(&self) -> &Brep {
+        self.b
+    }
+}
+
+impl qf2::CurveOnClassifyBrep<IntersectObject> for SelfMergeObjects<'_, '_> {
+    fn brep_mut(&mut self) -> &mut Brep {
+        self.b
+    }
+}
+
+impl MergeIntervalBrep<IntersectObject> for SelfMergeObjects<'_, '_> {
+    fn merge_context(
+        &mut self,
+        o: IntersectObject,
+    ) -> Option<ClassMergeContext<'_, IntersectObject>> {
+        let IntersectObject::Topology(target, side) = o else {
+            return None;
+        };
+        if !matches!(
+            target,
+            EntityRef::Vertex(_) | EntityRef::Edge(_) | EntityRef::Face(_) | EntityRef::Region(_)
+        ) {
+            return None;
+        }
+        Some(ClassMergeContext {
+            brep: &mut *self.b,
+            target,
+            handle: Box::new(move |e| IntersectObject::Topology(e, side)),
+            notifications: ed::NotifyEnv {
+                records: &mut *self.env.records,
+                attributes: &mut *self.env.attributes,
+                context: self.env.context.as_deref_mut(),
+                key_of: self.env.key_of,
+            },
+            curve_ref: self.curve_ref,
+        })
+    }
 }
 
 /// `sCC.SetCurve(curve_3d)` and `sCC.MergeIntervals(&newFaces, NULL, NULL, face)`: the
 /// faces the merge made.
 fn set_curve_and_merge(
-    k: &Kernel,
-    objects: &IntersectObjects<'_>,
+    k: &mut Kernel,
+    objects: &mut SelfMergeObjects<'_, '_>,
     cc: &mut SelfClassification,
     curve_3d: IntersectObject,
 ) -> Result<Vec<FaceId>> {
     cc.set_curve(Some(curve_3d), false);
-    let merged = cc.merge_intervals(k, objects, false)?;
+    let merged = cc.merge_intervals_mut(k, objects, false)?;
     merged
         .faces
         .into_iter()
@@ -490,7 +650,7 @@ fn mid_edge(ivl: &CurveInterval<IntersectObject>) -> Result<EdgeId> {
 // ---- owning-list edits ----------------------------------------------------------------------
 
 /// `SmEdge::Remove(eu)`: unlinks the edge use from the edge.
-fn edge_remove(b: &mut Brep, e: EdgeId, eu: EdgeuseId) -> Result<()> {
+pub(crate) fn edge_remove(b: &mut Brep, e: EdgeId, eu: EdgeuseId) -> Result<()> {
     let list = &mut b.edge_mut(e)?.edgeuses;
     let Some(at) = list.iter().position(|&x| x == eu) else {
         return Err(SolidError::sm_err(OP));
@@ -500,9 +660,16 @@ fn edge_remove(b: &mut Brep, e: EdgeId, eu: EdgeuseId) -> Result<()> {
     Ok(())
 }
 
-/// Merges `del_shell` into `keep_shell` and drops the empty region (the shell-merging
-/// tails of `GlueEdgesGeneral`).
-fn merge_shells(k: &mut Kernel, b: &mut Brep, mut del: ShellId, mut keep: ShellId) -> Result<()> {
+/// Merges `del_shell` into `keep_shell`, deletes it (`delete pDelShell`: its destruction
+/// notification under `env`, its record and attribute uses) and drops the emptied
+/// region (the shell-merging tails of `GlueEdgesGeneral`).
+fn merge_shells(
+    k: &mut Kernel,
+    b: &mut Brep,
+    mut del: ShellId,
+    mut keep: ShellId,
+    env: &mut ed::NotifyEnv<'_>,
+) -> Result<()> {
     // m_pInfiniteRegion (NULL when unset; pointer equality, NULL == NULL)
     let inf = b.infinite_region();
     let keep_region = eu1::shell_region(b, keep)?;
@@ -512,7 +679,7 @@ fn merge_shells(k: &mut Kernel, b: &mut Brep, mut del: ShellId, mut keep: ShellI
     } else if del_region == inf
         // pKeepShell->IsInnerShell(bIsInner): swap when it succeeds with TRUE (asked
         // only when neither region is the infinite one)
-        || ignored(b.shell(keep)?.is_inner_shell(k, b))? == Some(true)
+        || ignored(crate::topology::Shell::is_inner_shell(k, b, keep))? == Some(true)
     {
         core::mem::swap(&mut del, &mut keep);
     }
@@ -521,8 +688,10 @@ fn merge_shells(k: &mut Kernel, b: &mut Brep, mut del: ShellId, mut keep: ShellI
 
     // remove it from its region, then the region when empty
     let reg = eu1::shell_region(b, del)?.ok_or_else(|| null("shell without region"))?;
-    // pReg->Remove(pDelShell), then pReg->GetSize()
+    // pReg->Remove(pDelShell); delete pDelShell (SmBrep.cpp:10200, 10429: ~SmShell, ported
+    // as shell::destroy); then pReg->GetSize()
     crate::topology::shell::region_remove_shell(b, reg, del)?;
+    crate::topology::shell::destroy(k, b, del, env)?;
     if b.region(reg)?.shells.is_empty() {
         remove_emptied_region(b, reg)?;
     }
@@ -532,9 +701,10 @@ fn merge_shells(k: &mut Kernel, b: &mut Brep, mut del: ShellId, mut keep: ShellI
 /// The tail of the shell merge once `reg` lost its last shell: `this->Remove(pReg)`
 /// (status ignored), then `m_pInfiniteRegion = m_pList`.
 fn remove_emptied_region(b: &mut Brep, reg: RegionId) -> Result<()> {
-    // Upstream deletes pReg even when Remove fails; a failed removal here leaves the
-    // region (and its in_brep) as it was. Unreachable: a merged shell's region is listed.
+    // Upstream deletes pReg even when Remove fails (unreachable: a merged shell's
+    // region is listed); `delete pReg` removes its record.
     ignore_status(brep_remove_region(b, reg))?;
+    b.remove_region_record(reg)?;
     // make sure infinite region points where it should: the first region of the list
     // (a stored head of None starts at the first region on the list; it is not an
     // empty list)
@@ -608,6 +778,198 @@ pub struct NewFace {
     pub face: Option<FaceId>,
 }
 
+/// What [`make_face_attempt`] returns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MakeFaceAttempt {
+    /// The status of the build: `Ok(())` on success, or the upstream failure.
+    pub status: Result<()>,
+    /// `rpNewRegion`: the region split off, if the face split one.
+    pub region: Option<RegionId>,
+    /// `rpNewShell`: the new shell, if any.
+    pub shell: Option<ShellId>,
+    /// `rpNewFace`: the new face.
+    pub face: Option<FaceId>,
+}
+
+/// `MakeFace` attempt variant preserving partial outputs (such as `region` on split).
+#[allow(clippy::too_many_arguments)]
+pub fn make_face_attempt(
+    k: &mut Kernel,
+    b: &mut Brep,
+    region: Option<RegionId>,
+    loops: &[usize],
+    edgeuses: &[EdgeuseId],
+    loop_vertices: &[VertexId],
+    surface: Option<Surface>,
+    uv_domain: &Extent2d,
+    orientation: OrientType,
+    opts: &MakeFaceOptions<'_>,
+    this_face: &dyn Fn(FaceId) -> ObjectRef,
+    env: &mut ed::NotifyEnv<'_>,
+) -> Result<MakeFaceAttempt> {
+    make_face_attempt_with_state(
+        k,
+        b,
+        region,
+        loops,
+        edgeuses,
+        loop_vertices,
+        surface,
+        uv_domain,
+        orientation,
+        opts,
+        this_face,
+        &mut ed::NotifyState::from_env(env),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_face_attempt_with_state(
+    k: &mut Kernel,
+    b: &mut Brep,
+    region: Option<RegionId>,
+    loops: &[usize],
+    edgeuses: &[EdgeuseId],
+    loop_vertices: &[VertexId],
+    surface: Option<Surface>,
+    uv_domain: &Extent2d,
+    orientation: OrientType,
+    opts: &MakeFaceOptions<'_>,
+    this_face: &dyn Fn(FaceId) -> ObjectRef,
+    env: &mut ed::NotifyState<'_>,
+) -> Result<MakeFaceAttempt> {
+    let Some(surface) = surface else {
+        return Err(SolidError::null_pointer(OP));
+    };
+    let mut transfer = p6::FaceSurfaceTransfer::new(surface);
+    let mut attempt = MakeFaceAttempt {
+        status: Ok(()),
+        region: None,
+        shell: None,
+        face: None,
+    };
+    make_face_transfer_attempt_with_state(
+        k,
+        b,
+        region,
+        loops,
+        edgeuses,
+        loop_vertices,
+        &mut transfer,
+        uv_domain,
+        orientation,
+        opts,
+        this_face,
+        env,
+        true,
+        &mut attempt,
+    )?;
+    Ok(attempt)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_face_transfer_attempt_with_state(
+    k: &mut Kernel,
+    b: &mut Brep,
+    region: Option<RegionId>,
+    loops: &[usize],
+    edgeuses: &[EdgeuseId],
+    loop_vertices: &[VertexId],
+    transfer: &mut p6::FaceSurfaceTransfer,
+    uv_domain: &Extent2d,
+    orientation: OrientType,
+    opts: &MakeFaceOptions<'_>,
+    this_face: &dyn Fn(FaceId) -> ObjectRef,
+    env: &mut ed::NotifyState<'_>,
+    legacy: bool,
+    out: &mut MakeFaceAttempt,
+) -> Result<()> {
+    *out = MakeFaceAttempt {
+        status: Ok(()),
+        region: None,
+        shell: None,
+        face: None,
+    };
+    transfer.owned_surface()?;
+    let region = region.or(b.infinite_region());
+    let old_owner = transfer.owned_surface()?.owner();
+    let options = p6::FaceTopologyOptions {
+        region,
+        edge_loops: loops,
+        edgeuses,
+        loop_vertices,
+        verify_radial_sectors: opts.verify_radial_sectors,
+        calculate_trims: opts.calculate_trims,
+        uv_curves: opts.uv_curves,
+        surface_key: None,
+    };
+    let attempt = if legacy {
+        // The copy shares the original's caches: upstream builds the face on the one
+        // surface `MakeFace` keeps, so a cache made while building it stays with it.
+        let mut copy =
+            p6::FaceSurfaceTransfer::new(transfer.owned_surface()?.clone_sharing_cache());
+        p6::make_face_topology_transfer_attempt_with_state(
+            k,
+            b,
+            &mut Marks::default(),
+            env,
+            &mut copy,
+            orientation,
+            &options,
+        )
+    } else {
+        p6::make_face_topology_transfer_attempt_with_state(
+            k,
+            b,
+            &mut Marks::default(),
+            env,
+            transfer,
+            orientation,
+            &options,
+        )
+    };
+    // Only the legacy copy leaves the original outside the installed face.
+    if legacy {
+        transfer.surface_mut(b)?.set_owner(old_owner);
+    }
+    out.region = attempt.region;
+    out.shell = attempt.shell;
+    out.face = attempt.face;
+    let result = (|| {
+        if let Err(error) = attempt.status {
+            if matches!(error, SolidError::Upstream { .. }) {
+                out.status = Err(error);
+                return Ok(());
+            }
+            return Err(error);
+        }
+        let new_face = attempt.face.ok_or_else(|| null("MakeFace made no face"))?;
+        b.face_mut(new_face)?.uv_domain = *uv_domain;
+        let tol = b.tolerance();
+        face_set_tolerance(b, new_face, tol, true, true)?;
+        let owner = this_face(new_face);
+        if legacy {
+            transfer.install(b, new_face)?;
+        }
+        transfer.surface_mut(b)?.set_owner(Some(owner));
+        b.geometry_owner_keys
+            .insert(EntityRef::Face(new_face), owner);
+        b.sync_face_surface_tolerance(new_face)?;
+        Ok(())
+    })();
+    if !legacy && (result.is_err() || out.status.is_err()) {
+        if let Some(face) = transfer.installed_face() {
+            // Topology may fail after installing the original. Keep that partial
+            // result canonical without changing its status or construction order.
+            let owner = this_face(face);
+            transfer.surface_mut(b)?.set_owner(Some(owner));
+            b.geometry_owner_keys.insert(EntityRef::Face(face), owner);
+            b.sync_face_surface_tolerance(face)?;
+        }
+    }
+    result
+}
+
 /// `MakeFace`: makes a face on `surface` (over `uv_domain`) in `region` (the infinite
 /// region for `None`) from existing edge uses, `loops` giving the number of edge uses of
 /// each loop (outer loop first, counter-clockwise when `orientation` is
@@ -664,54 +1026,25 @@ fn make_face_with_state(
     this_face: &dyn Fn(FaceId) -> ObjectRef,
     env: &mut ed::NotifyState<'_>,
 ) -> Result<NewFace> {
-    let Some(mut surface) = surface else {
-        return Err(SolidError::null_pointer(OP));
-    };
-    // GetInfiniteRegion() (an inline field read; NULL when unset)
-    let region = region.or(b.infinite_region());
-
-    // get preexisting surface owner
-    let old_owner = surface.owner();
-    // MakeFaceTopology claims a new mark: a fresh mark record serves (see p10)
-    let built = p6::make_face_topology_with_state(
+    let attempt = make_face_attempt_with_state(
         k,
         b,
-        &mut Marks::default(),
-        env,
-        Some(surface.clone()),
+        region,
+        loops,
+        edgeuses,
+        loop_vertices,
+        surface,
+        uv_domain,
         orientation,
-        &p6::FaceTopologyOptions {
-            region,
-            edge_loops: loops,
-            edgeuses,
-            loop_vertices,
-            verify_radial_sectors: opts.verify_radial_sectors,
-            calculate_trims: opts.calculate_trims,
-            uv_curves: opts.uv_curves,
-            surface_key: None,
-        },
-    );
-    // restore the preexisting surface owner, whether the build fails or succeeds
-    surface.set_owner(old_owner);
-    let built = built?;
-    let (new_region, new_shell, new_face) = (built.region, built.shell, built.face);
-
-    b.face_mut(new_face)?.uv_domain = *uv_domain;
-
-    // default face tolerance to Brep tolerance
-    let tol = b.tolerance();
-    // SetTolerance(GetTolerance()) = (tol, TRUE, TRUE): grow only, cascade
-    face_set_tolerance(b, new_face, tol, true, true)?;
-
-    // make the face->surface connections
-    surface.set_owner(Some(this_face(new_face)));
-    b.face_mut(new_face)?.surface = Some(surface);
-    b.sync_face_surface_tolerance(new_face)?;
-
+        opts,
+        this_face,
+        env,
+    )?;
+    attempt.status?;
     Ok(NewFace {
-        region: new_region,
-        shell: new_shell,
-        face: Some(new_face),
+        region: attempt.region,
+        shell: attempt.shell,
+        face: attempt.face,
     })
 }
 
@@ -907,6 +1240,74 @@ fn make_face_with_curves_impl(
     curve_owners: &mut Vec<Option<EdgeId>>,
     state: &mut ed::NotifyState<'_>,
 ) -> Result<NewFace> {
+    let mut transfer = p6::FaceSurfaceTransfer::new(surface);
+    let mut out = NewFace::default();
+    make_face_with_curves_transfer_impl(
+        k,
+        b,
+        region,
+        input,
+        &mut transfer,
+        uv_domain,
+        orientation,
+        crv_on_surf,
+        this_face,
+        curve_owners,
+        state,
+        &mut out,
+        true,
+    )?;
+    Ok(out)
+}
+
+/// Constructs with the original surface, retaining its location and partial outputs on error.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_face_with_curves_transfer(
+    k: &mut Kernel,
+    b: &mut Brep,
+    region: Option<RegionId>,
+    input: FaceCurvesInput,
+    transfer: &mut p6::FaceSurfaceTransfer,
+    uv_domain: &Extent2d,
+    orientation: OrientType,
+    crv_on_surf: Option<bool>,
+    this_face: &dyn Fn(FaceId) -> ObjectRef,
+    env: &mut ed::NotifyEnv<'_>,
+    out: &mut NewFace,
+) -> Result<()> {
+    make_face_with_curves_transfer_impl(
+        k,
+        b,
+        region,
+        input,
+        transfer,
+        uv_domain,
+        orientation,
+        crv_on_surf,
+        this_face,
+        &mut Vec::new(),
+        &mut ed::NotifyState::from_env(env),
+        out,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn make_face_with_curves_transfer_impl(
+    k: &mut Kernel,
+    b: &mut Brep,
+    region: Option<RegionId>,
+    input: FaceCurvesInput,
+    transfer: &mut p6::FaceSurfaceTransfer,
+    uv_domain: &Extent2d,
+    orientation: OrientType,
+    crv_on_surf: Option<bool>,
+    this_face: &dyn Fn(FaceId) -> ObjectRef,
+    curve_owners: &mut Vec<Option<EdgeId>>,
+    state: &mut ed::NotifyState<'_>,
+    out: &mut NewFace,
+    legacy: bool,
+) -> Result<()> {
     curve_owners.clear();
     let FaceCurvesInput {
         loops,
@@ -915,7 +1316,8 @@ fn make_face_with_curves_impl(
         orientations,
         loop_points,
     } = input;
-    let mut out = NewFace::default();
+    *out = NewFace::default();
+    let surface = transfer.owned_surface()?;
 
     // check input
     if curves_3d.is_none() && uv_curves.is_none() {
@@ -1058,7 +1460,7 @@ fn make_face_with_curves_impl(
                         InValueType::Unconstrained,
                         None,
                         InValueType::Unconstrained,
-                        Some((&surface, None)),
+                        Some((surface, None)),
                     ))?
                     .flatten();
                     if let Some(d) = deformed {
@@ -1258,25 +1660,35 @@ fn make_face_with_curves_impl(
         }
     }
 
-    let made = make_face_with_state(
+    let mut made = MakeFaceAttempt {
+        status: Ok(()),
+        region: None,
+        shell: None,
+        face: None,
+    };
+    let result = make_face_transfer_attempt_with_state(
         k,
         b,
         region,
         &sorted_loops,
         &face_edgeuses,
         &loop_vertices,
-        Some(surface),
+        transfer,
         uv_domain,
         orientation,
         &MakeFaceOptions::default(),
         this_face,
         state,
-    )?;
+        legacy,
+        &mut made,
+    );
     out.region = made.region;
     if made.shell.is_some() && out.shell.is_some() {
         out.shell = made.shell;
     }
     out.face = made.face;
+    result?;
+    made.status?;
 
     // with curves on surface: make the UV trim curves from the given UV curves
     if crv_on_surf {
@@ -1300,7 +1712,7 @@ fn make_face_with_curves_impl(
             Ok(()) | Err(_) => {}
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 // ---- GlueEdgesGeneral -----------------------------------------------------------------------
@@ -1614,7 +2026,7 @@ pub fn glue_edges_general(
         let del_shell = eu1::shell(b, eu)?.ok_or_else(|| null("edge use without shell"))?;
         let keep_shell = eu1::shell(b, radial)?.ok_or_else(|| null("edge use without shell"))?;
         if del_shell != keep_shell {
-            merge_shells(k, b, del_shell, keep_shell)?;
+            merge_shells(k, b, del_shell, keep_shell, env)?;
         }
     }
 
@@ -1642,15 +2054,134 @@ pub fn glue_edges_general(
 /// never lowered). Returns the
 /// new faces of `dest`, and whether every face was copied.
 ///
+/// (not upstream: upstream's objects are their own identities.) `env.key_of` names both
+/// B-reps here, so a copy and a source object of one arena id would share a key; the
+/// source is named apart for the copy as [`copy_faces_from`] describes. A caller whose
+/// source objects carry attributes names them apart itself ([`copy_faces_from`]).
+///
 /// # Errors
 ///
-/// `SM_ERR` for a face of another B-rep; [`SolidError::Unported`] (see the module docs).
+/// `SM_ERR` for a face of another B-rep; [`SolidError::Unported`] (see the module docs);
+/// `InvalidInput` as [`copy_faces_from`].
 pub fn copy_faces(
     k: &mut Kernel,
     src: &mut Brep,
     faces: &[FaceId],
     dest: &mut Brep,
     use_merge: bool,
+    this_face: &dyn Fn(FaceId) -> ObjectRef,
+    env: &mut ed::NotifyEnv<'_>,
+) -> Result<(Vec<FaceId>, bool)> {
+    let source_key = env.key_of;
+    copy_faces_from(k, src, faces, dest, use_merge, source_key, this_face, env)
+}
+
+/// [`copy_faces`] with the source objects notified under `source_key` instead of the
+/// environment's identities ([`ed::NotifyEnv::key_of`], which name the destination's):
+/// a copy between two B-reps whose attributes travel with the notifications
+/// (`crate::topology::brep::p2::CopyNotifyState`, `source_key` its
+/// `copy_source_ref`), as upstream's `SM_NO_COPY` gives each new object its source's.
+///
+/// (not upstream: upstream's objects are their own identities.) Namings that coincide
+/// on `src`'s objects (`source_key` and `env.key_of` / `this_face` alike, as
+/// [`copy_faces`] has them) would make a copy and a source object of one arena id share
+/// a key, and `SM_NO_COPY` would cross their attribute lists both ways (#1869 review).
+/// `src` is then named in a private domain for the copy (as `api_brep_copy` does, #1884),
+/// with the caller's records and attribute lists of it lent there and taken back after.
+/// Where a source object's list is on a key that naming gives the copies too, the call
+/// is refused: the source and its copies cannot keep their own lists apart in one store.
+/// `this_face` owns each new face's surface: [`super::validation::check_brep`] resolves
+/// owners by `dest`'s naming scheme, so a key outside it (a caller's own domain on a
+/// [`crate::topology::NamingScheme::Notify`] B-rep) reads as no owner (Test #35).
+///
+/// # Errors
+///
+/// As [`copy_faces`]; `InvalidInput` (before anything changes) for coinciding namings
+/// where a source object's attribute list is on a key the copies' naming gives out, or
+/// when no private domain is left for `src`'s names.
+#[allow(clippy::too_many_arguments)] // copy_faces's arguments and the source identities
+pub fn copy_faces_from(
+    k: &mut Kernel,
+    src: &mut Brep,
+    faces: &[FaceId],
+    dest: &mut Brep,
+    use_merge: bool,
+    source_key: &dyn Fn(EntityRef) -> ObjectRef,
+    this_face: &dyn Fn(FaceId) -> ObjectRef,
+    env: &mut ed::NotifyEnv<'_>,
+) -> Result<(Vec<FaceId>, bool)> {
+    // (not upstream) the copies' names (`env.key_of`, `this_face` for faces) against
+    // the source's: where they coincide on the source's objects, a copy would take the
+    // key of the source object of its arena id.
+    let dest_key_of = env.key_of;
+    let dest_name = |e: EntityRef| match e {
+        EntityRef::Face(f) => this_face(f),
+        other => dest_key_of(other),
+    };
+    let live = p2::live_entities(src);
+    let shift = super::p3::private_source_shift(&live, source_key, &dest_name)?;
+    let Some(shift) = shift else {
+        return copy_faces_named(k, src, faces, dest, use_merge, source_key, this_face, env);
+    };
+    // a source object's list on a key the copies' naming also gives out would be a
+    // copy's list too
+    let dest_keys: std::collections::BTreeSet<ObjectKey> =
+        live.iter().map(|&e| dest_name(e).key).collect();
+    let listed: Vec<EntityRef> = live
+        .iter()
+        .copied()
+        .filter(|&e| !env.attributes.attributes(source_key(e).key).is_empty())
+        .collect();
+    if listed
+        .iter()
+        .any(|&e| dest_keys.contains(&source_key(e).key))
+    {
+        return Err(SolidError::invalid_input(
+            OP,
+            "the source and its copies are named alike where the source has attributes",
+        ));
+    }
+    let shifted = |e: EntityRef| {
+        let r = source_key(e);
+        ObjectRef {
+            type_code: r.type_code,
+            key: ObjectKey(r.key.0 + shift),
+        }
+    };
+    // the caller's records and lists of the source, lent to its private names for the
+    // copy and taken back after
+    for &e in &live {
+        if let Some(&r) = env.records.get(&source_key(e).key) {
+            env.records.insert(shifted(e).key, r);
+        }
+    }
+    let mut lent = Vec::new();
+    for &e in &listed {
+        let key = shifted(e).key;
+        for h in env.attributes.attributes(source_key(e).key) {
+            env.attributes.add_attribute(key, h)?;
+            lent.push((key, h));
+        }
+    }
+    let copied = copy_faces_named(k, src, faces, dest, use_merge, &shifted, this_face, env);
+    for (key, h) in lent {
+        env.attributes.remove_attribute(key, h, true)?;
+    }
+    for &e in &live {
+        env.records.remove(&shifted(e).key);
+    }
+    copied
+}
+
+/// [`copy_faces_from`] once the source's names (`source_key`) are apart from the copies'.
+#[allow(clippy::too_many_arguments)] // copy_faces_from's arguments
+fn copy_faces_named(
+    k: &mut Kernel,
+    src: &mut Brep,
+    faces: &[FaceId],
+    dest: &mut Brep,
+    use_merge: bool,
+    source_key: &dyn Fn(EntityRef) -> ObjectRef,
     this_face: &dyn Fn(FaceId) -> ObjectRef,
     env: &mut ed::NotifyEnv<'_>,
 ) -> Result<(Vec<FaceId>, bool)> {
@@ -1673,16 +2204,16 @@ pub fn copy_faces(
             20.0 * PI / 180.0,
             None,
         )?;
-        let source_key = env.key_of;
+        let destination_key = env.key_of;
         let mut copy = TopologyCopy {
             vertices: VertexCopy {
                 records: env.records,
                 attributes: env.attributes,
                 source_key: &|v| source_key(EntityRef::Vertex(v)),
-                destination_key: source_key,
+                destination_key,
             },
             edge_source_key: &|e| source_key(EntityRef::Edge(e)),
-            edge_destination_key: &|e| source_key(EntityRef::Edge(e)),
+            edge_destination_key: &|e| destination_key(EntityRef::Edge(e)),
             face_source_key: &|f| source_key(EntityRef::Face(f)),
             face_destination_key: this_face,
         };
@@ -1723,7 +2254,7 @@ pub fn copy_faces(
         // (status ignored upstream, which then dereferences the null copy)
         let s2 = ignored(s1.copy_and_add_analytics(k))?
             .ok_or_else(|| null("CopyAndAddAnalytics failed (upstream dereferences null)"))?;
-        let dom = s2.natural_uv_domain();
+        let dom = s2.natural_uv_domain_with_nurb(k)?;
         let input = FaceCurvesInput {
             loops: curves
                 .curve_loops
@@ -1751,12 +2282,32 @@ pub fn copy_faces(
                 if let Some(nf) = made.face {
                     new_faces.push(nf);
                 }
-                // SmFace::Notify(SM_NO_COPY, pNewFace, pDestinationBrep, this)
-                face_notify(
+                // SmFace::Notify(SM_NO_COPY, pNewFace, pDestinationBrep, this), through
+                // the caller's records and attributes (the B-reps have no identity
+                // here). Both faces are SmTopology objects upstream, the new one with
+                // the default record its constructor gives it, so a face the caller
+                // has no record for gets one (#1628: a fresh empty map failed as soon
+                // as the new face's identity differed from the source face's).
+                let this = source_key(EntityRef::Face(f));
+                let new_face = made.face.map(this_face);
+                env.records.or_default(this.key);
+                if let Some(nf) = new_face {
+                    env.records.or_default(nf.key);
+                }
+                // (the source face notifies under its own identities)
+                let mut src_env = ed::NotifyEnv {
+                    records: &mut *env.records,
+                    attributes: &mut *env.attributes,
+                    context: env.context.as_deref_mut(),
+                    key_of: source_key,
+                };
+                crate::topology::face::p3::notify(
                     src,
                     f,
+                    &mut src_env,
+                    None,
                     NotifyOperation::Copy,
-                    [made.face.map(EntityRef::Face), None, None],
+                    [new_face, None, None],
                 )?;
             }
             Err(e) if e.is_unported() => return Err(e),
@@ -1807,13 +2358,16 @@ pub struct SelfIntersectionCurve {
 
 /// `MergeSelfIntersectionCurves`: imprints each self-intersection curve of the surface of
 /// `face` on the face (through both UV curves) and glues the two edges made for it,
-/// giving non-manifold edges with four face uses. Returns the glued edges.
+/// giving non-manifold edges with four face uses. Returns the glued edges. The merges
+/// edit `b` (vertex loops, edge splits and new edges, notified in `env`); `curve_ref`
+/// names an edge's curve by the edge and the curve's type code, the curve of an edge a
+/// split makes included.
 ///
 /// # Errors
 ///
 /// `SM_ERR` when the second classification does not give one interval; those of the
-/// classifications, vertex and edge gluing; [`SolidError::Unported`] (the
-/// classifications' callees, `GlueVertices`, `GlueEdgesGeneral`'s callees).
+/// classifications, their B-rep edits, vertex and edge gluing; [`SolidError::Unported`]
+/// (the classifications' callees, `GlueVertices`, `GlueEdgesGeneral`'s callees).
 pub fn merge_self_intersection_curves(
     k: &mut Kernel,
     b: &mut Brep,
@@ -1821,6 +2375,7 @@ pub fn merge_self_intersection_curves(
     tol_3d: f64,
     curves: &[SelfIntersectionCurve],
     env: &mut ed::NotifyEnv<'_>,
+    curve_ref: &dyn Fn(EdgeId, i64) -> ObjectRef,
 ) -> Result<Vec<EdgeId>> {
     let mut new_edges = Vec::new();
     let mut all_faces: Vec<FaceId> = face.into_iter().collect();
@@ -1831,30 +2386,30 @@ pub fn merge_self_intersection_curves(
     };
     // the classifications' curves: curve i is IntersectObject::Curve(i), its UV curves
     // IntersectObject::UvCurve(i, false / true)
-    let curves_3d: Vec<Curve> = curves.iter().map(|c| c.curve_3d.clone()).collect();
+    let mut curves_3d: Vec<Curve> = curves.iter().map(|c| c.curve_3d.clone()).collect();
     let uv1: Vec<Option<Curve>> = curves.iter().map(|c| Some(c.uv_curve_1.clone())).collect();
     let uv2: Vec<Option<Curve>> = curves.iter().map(|c| Some(c.uv_curve_2.clone())).collect();
     for (i, c) in curves.iter().enumerate() {
         let tol = tol_3d;
         let curve_3d = IntersectObject::Curve(i);
-        let objects = IntersectObjects {
-            b: &*b,
-            other: &*b,
-            side: false,
-            curves_3d: &curves_3d,
+        let mut merge_objects = SelfMergeObjects {
+            b: &mut *b,
+            curves_3d: &mut curves_3d,
             uv1: &uv1,
             uv2: &uv2,
+            env: &mut *env,
+            curve_ref,
         };
         let mut cc1 = classify_on_faces(
             k,
-            &objects,
+            &mut merge_objects,
             &all_faces,
             face,
             IntersectObject::UvCurve(i, false),
             c.uv_curve_1.natural_interval(),
             tol,
         )?;
-        let new_faces = set_curve_and_merge(k, &objects, &mut cc1, curve_3d)?;
+        let new_faces = set_curve_and_merge(k, &mut merge_objects, &mut cc1, curve_3d)?;
         all_faces.extend(new_faces);
         // (the intervals are copied: the gluing below edits the B-rep the
         // classification's objects borrow)
@@ -1864,17 +2419,17 @@ pub fn merge_self_intersection_curves(
                 continue;
             }
             let e1 = mid_edge(ivl)?;
-            let objects = IntersectObjects {
-                b: &*b,
-                other: &*b,
-                side: false,
-                curves_3d: &curves_3d,
+            let mut merge_objects = SelfMergeObjects {
+                b: &mut *b,
+                curves_3d: &mut curves_3d,
                 uv1: &uv1,
                 uv2: &uv2,
+                env: &mut *env,
+                curve_ref,
             };
             let mut cc2 = classify_on_faces(
                 k,
-                &objects,
+                &mut merge_objects,
                 &all_faces,
                 face,
                 IntersectObject::UvCurve(i, true),
@@ -1884,7 +2439,7 @@ pub fn merge_self_intersection_curves(
             if cc2.size() != 1 {
                 continue;
             }
-            let new_faces = set_curve_and_merge(k, &objects, &mut cc2, curve_3d)?;
+            let new_faces = set_curve_and_merge(k, &mut merge_objects, &mut cc2, curve_3d)?;
             all_faces.extend(new_faces);
             let [ivl2] = cc2.intervals() else {
                 return Err(SolidError::sm_err(OP));
@@ -2007,7 +2562,7 @@ mod tests {
             .unwrap();
         b.set_infinite_region(Some(region));
         let mut owners = vec![Some(EdgeId::from_index(99))];
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::default();
         let mut env = ed::NotifyEnv {
             records: &mut records,
@@ -2046,7 +2601,7 @@ mod tests {
         let v0 = b.add_vertex(Point3::new(0.0, 0.0, 0.0)).unwrap();
         let v1 = b.add_vertex(Point3::new(1.0, 0.0, 0.0)).unwrap();
         let e = b.add_edge(v0, v1).unwrap();
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attrs = AttributeStore::default();
         let mut env = ed::NotifyEnv {
             records: &mut records,
@@ -2250,7 +2805,7 @@ mod tests {
                 b.vertex(shared_ends[1]).unwrap().point,
                 3,
             )));
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::default();
         glue_edges_general(
             &mut k,
@@ -2308,7 +2863,7 @@ mod tests {
         let key_of = crate::topology::loopuse::notify_ref;
         let surviving_ref = key_of(EntityRef::Edge(surviving));
         let deleted_ref = key_of(EntityRef::Edge(deleted));
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::default();
         let shared = attributes
             .insert(Attribute::long(81, 912, Behavior::Reference))
@@ -2356,7 +2911,6 @@ mod tests {
         use crate::geom::context::Context;
         use crate::topology::edge::notification_test_support as callbacks;
         use crate::topology::topology::Topology;
-        use std::collections::BTreeMap;
 
         for with_context in [true, false] {
             let mut k = Kernel::default();
@@ -2381,11 +2935,12 @@ mod tests {
             edge_record.set_all_flags(0x40);
             let mut face_record = Topology::default();
             face_record.set_user_index1(912);
-            let mut records = BTreeMap::from([
-                (surviving_ref.key, edge_record),
-                (deleted_ref.key, edge_record),
-                (face_ref.key, face_record),
-            ]);
+            let mut records =
+                crate::topology::topology::NotifyRecords::from(std::collections::BTreeMap::from([
+                    (surviving_ref.key, edge_record),
+                    (deleted_ref.key, edge_record),
+                    (face_ref.key, face_record),
+                ]));
             let before = records.clone();
             let mut attributes = AttributeStore::default();
             let label = attributes
@@ -2461,7 +3016,7 @@ mod tests {
         let mut k = Kernel::default();
         let mut b = Brep::new();
         let opts = MakeFaceOptions::default();
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attrs = AttributeStore::default();
         let mut env = ed::NotifyEnv {
             records: &mut records,
@@ -2547,6 +3102,229 @@ mod tests {
     }
 
     #[test]
+    fn transfer_installs_original_surface_identity_in_actual_face() {
+        let mut k = Kernel::default();
+        let mut b = Brep::new_with_infinite_region().unwrap();
+        let mut surface = plane();
+        let key = k
+            .context
+            .geometry_key(surface.notify_identity_slot())
+            .unwrap();
+        let mut transfer = p6::FaceSurfaceTransfer::new(surface);
+        let mut out = NewFace::default();
+        let mut records = crate::topology::topology::NotifyRecords::new();
+        let mut attributes = AttributeStore::default();
+        let mut env = ed::NotifyEnv {
+            records: &mut records,
+            attributes: &mut attributes,
+            context: None,
+            key_of: &key_of,
+        };
+        make_face_with_curves_transfer(
+            &mut k,
+            &mut b,
+            None,
+            FaceCurvesInput {
+                loops: vec![1],
+                curves_3d: Some(vec![None]),
+                orientations: vec![OrientType::Same],
+                ..Default::default()
+            },
+            &mut transfer,
+            &dom(),
+            OrientType::Same,
+            None,
+            &face_ref,
+            &mut env,
+            &mut out,
+        )
+        .unwrap();
+        let face = out.face.unwrap();
+        assert_eq!(transfer.installed_face(), Some(face));
+        assert!(
+            matches!(transfer.into_location().unwrap(), p6::FaceSurfaceLocation::Installed(id) if id==face)
+        );
+        let installed = b.face(face).unwrap().surface.as_ref().unwrap();
+        // Clone resets the issued identity: this proves transfer of the original,
+        // rather than merely equal geometry or a copied owner field.
+        assert_eq!(installed.notify_key(), Some(key));
+        assert_eq!(installed.owner(), Some(face_ref(face)));
+        assert_eq!(
+            b.geometry_owner_keys.get(&EntityRef::Face(face)),
+            Some(&face_ref(face))
+        );
+        assert_eq!(
+            installed.owner_zone_tol_3d(),
+            Some(b.face(face).unwrap().tolerance)
+        );
+    }
+
+    #[test]
+    fn transfer_failure_keeps_surface_owner_consistent_with_its_location() {
+        // Invalid arena ids are Rust-only failure injection, never C++ inputs.
+        for late in [false, true] {
+            for old_owner in [None, Some(face_ref(FaceId::from_index(99)))] {
+                let mut k = Kernel::default();
+                let mut b = if late {
+                    Brep::new_with_infinite_region().unwrap()
+                } else {
+                    Brep::new()
+                };
+                let mut surface = plane();
+                surface.set_owner(old_owner);
+                let key = k
+                    .context
+                    .geometry_key(surface.notify_identity_slot())
+                    .unwrap();
+                let mut transfer = p6::FaceSurfaceTransfer::new(surface);
+                let mut out = MakeFaceAttempt {
+                    status: Ok(()),
+                    region: None,
+                    shell: None,
+                    face: None,
+                };
+                let mut records = crate::topology::topology::NotifyRecords::new();
+                let mut attributes = AttributeStore::default();
+                let mut env = ed::NotifyEnv {
+                    records: &mut records,
+                    attributes: &mut attributes,
+                    context: None,
+                    key_of: &key_of,
+                };
+                let vertices = [VertexId::from_index(99)];
+                let result = make_face_transfer_attempt_with_state(
+                    &mut k,
+                    &mut b,
+                    None,
+                    &[],
+                    &[],
+                    if late { &vertices } else { &[] },
+                    &mut transfer,
+                    &dom(),
+                    OrientType::Same,
+                    &MakeFaceOptions::default(),
+                    &face_ref,
+                    &mut ed::NotifyState::from_env(&mut env),
+                    false,
+                    &mut out,
+                );
+                assert_eq!(out.region, None);
+                if late {
+                    assert!(matches!(result, Err(SolidError::NotFound { .. })));
+                    assert!(out.status.is_ok());
+                    let face = out.face.unwrap();
+                    assert!(out.shell.is_some());
+                    assert_eq!(transfer.installed_face(), Some(face));
+                    assert!(
+                        matches!(transfer.into_location().unwrap(), p6::FaceSurfaceLocation::Installed(id) if id == face)
+                    );
+                    let record = b.face(face).unwrap();
+                    let installed = record.surface.as_ref().unwrap();
+                    assert!(matches!(
+                        installed.kind(),
+                        crate::surface::surface::SurfaceKind::Plane(_)
+                    ));
+                    assert_eq!(installed.notify_key(), Some(key));
+                    assert_eq!(installed.owner(), Some(face_ref(face)));
+                    assert_eq!(
+                        b.geometry_owner_keys.get(&EntityRef::Face(face)),
+                        Some(&face_ref(face))
+                    );
+                    assert_eq!(installed.owner_zone_tol_3d(), Some(record.tolerance));
+                } else {
+                    result.unwrap();
+                    assert!(matches!(
+                        out.status,
+                        Err(SolidError::Upstream {
+                            code: crate::error::SM_ERR_NULL_POINTER,
+                            ..
+                        })
+                    ));
+                    assert_eq!(out.face, None);
+                    assert_eq!(out.shell, None);
+                    assert!(b.faces().is_empty());
+                    assert!(b.geometry_owner_keys.is_empty());
+                    match transfer.into_location().unwrap() {
+                        p6::FaceSurfaceLocation::Owned(surface) => {
+                            assert_eq!(surface.notify_key(), Some(key));
+                            assert_eq!(surface.owner(), old_owner);
+                        }
+                        p6::FaceSurfaceLocation::Installed(_) => {
+                            panic!("surface installed before early failure")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_transfer_retains_original_surface_and_partial_wire_topology() {
+        let mut k = Kernel::default();
+        let mut b = Brep::new_with_infinite_region().unwrap();
+        let mut surface = plane();
+        let key = k
+            .context
+            .geometry_key(surface.notify_identity_slot())
+            .unwrap();
+        let mut transfer = p6::FaceSurfaceTransfer::new(surface);
+        let mut out = NewFace::default();
+        let mut records = crate::topology::topology::NotifyRecords::new();
+        let mut attributes = AttributeStore::default();
+        let mut env = ed::NotifyEnv {
+            records: &mut records,
+            attributes: &mut attributes,
+            context: None,
+            key_of: &key_of,
+        };
+        let error = make_face_with_curves_transfer(
+            &mut k,
+            &mut b,
+            None,
+            FaceCurvesInput {
+                loops: vec![1],
+                curves_3d: Some(vec![Some(Curve::from(
+                    crate::curve::line::Line::from_points(Point3::ZERO, Point3::X, 3),
+                ))]),
+                orientations: vec![OrientType::Same],
+                ..Default::default()
+            },
+            &mut transfer,
+            &dom(),
+            OrientType::Same,
+            None,
+            &face_ref,
+            &mut env,
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SolidError::InvalidInput {
+                reason: "loop does not close",
+                ..
+            }
+        ));
+        assert_eq!(out.face, None);
+        assert_eq!(transfer.installed_face(), None);
+        match transfer.into_location().unwrap() {
+            p6::FaceSurfaceLocation::Owned(surface) => {
+                assert_eq!(surface.notify_key(), Some(key));
+                assert_eq!(surface.owner(), None);
+            }
+            p6::FaceSurfaceLocation::Installed(_) => {
+                panic!("surface installed before failed loop construction")
+            }
+        }
+        assert_eq!(b.vertices().len(), 1);
+        assert_eq!(b.shells().len(), 1);
+        assert_eq!(b.vertexuses().len(), 1);
+        assert!(b.faces().is_empty());
+        let (vertex, _) = b.vertices().iter().next().unwrap();
+        assert!(records.contains_key(&key_of(EntityRef::Vertex(vertex)).key));
+    }
+
+    #[test]
     fn face_with_curves_forwards_owner_keys_in_both_context_modes() {
         use crate::geom::context::Context;
         use crate::topology::edge::notification_test_support as callbacks;
@@ -2576,7 +3354,7 @@ mod tests {
                 requested.set(Some(face));
                 owner
             };
-            let mut records = std::collections::BTreeMap::new();
+            let mut records = crate::topology::topology::NotifyRecords::new();
             let mut attributes = AttributeStore::default();
             let input = FaceCurvesInput {
                 loops: vec![1],
@@ -2661,7 +3439,7 @@ mod tests {
         let mut k = Kernel::default();
         let mut b = Brep::new();
         let region = b.add_region_record(Region::default()).unwrap();
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attributes = AttributeStore::default();
         let key_of = crate::topology::loopuse::notify_ref;
         let mut stores = ed::NotificationStores {
@@ -2738,7 +3516,7 @@ mod tests {
                 ..Region::default()
             })
             .unwrap();
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attrs = AttributeStore::default();
         let mut env = ed::NotifyEnv {
             records: &mut records,
@@ -2811,7 +3589,7 @@ mod tests {
         let mut b = Brep::new();
         let s = b.add_shell().unwrap();
         let f = b.add_face(s).unwrap();
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attrs = AttributeStore::default();
         let mut env = ed::NotifyEnv {
             records: &mut records,
@@ -2819,16 +3597,32 @@ mod tests {
             context: None,
             key_of: &key_of,
         };
-        assert!(
-            merge_self_intersection_curves(&mut k, &mut b, Some(f), 1e-5, &[], &mut env)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            merge_self_intersection_curves(&mut k, &mut b, None, 1e-5, &[], &mut env)
-                .unwrap()
-                .is_empty()
-        );
+        let curve_ref = |_: EdgeId, type_code: i64| ObjectRef {
+            type_code,
+            key: ObjectKey(0),
+        };
+        assert!(merge_self_intersection_curves(
+            &mut k,
+            &mut b,
+            Some(f),
+            1e-5,
+            &[],
+            &mut env,
+            &curve_ref
+        )
+        .unwrap()
+        .is_empty());
+        assert!(merge_self_intersection_curves(
+            &mut k,
+            &mut b,
+            None,
+            1e-5,
+            &[],
+            &mut env,
+            &curve_ref
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -2836,7 +3630,7 @@ mod tests {
         let mut k = Kernel::default();
         let mut b = Brep::new_with_infinite_region().unwrap();
         let mut store = AttributeStore::new();
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut env = TopologyEnv {
             all_attributes: &[],
             attributes: &mut store,
@@ -2850,7 +3644,7 @@ mod tests {
         assert!(r.is_ok(), "read: {r:?}");
         let mut src = Brep::new();
         let mut dest = Brep::new();
-        let mut records = std::collections::BTreeMap::new();
+        let mut records = crate::topology::topology::NotifyRecords::new();
         let mut attrs = AttributeStore::default();
         let mut env = ed::NotifyEnv {
             records: &mut records,

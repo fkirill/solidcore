@@ -95,14 +95,21 @@ pub trait PrimitiveAccess: SweepAccess {
             .ok_or_else(|| SolidError::null_pointer("primitive::primitive_creation::p3::wire"))?
             .clone();
         let interval = input.natural_interval();
-        let edge = self.with_brep_mut(brep, |kernel, model, _, _| {
-            crate::topology::brep::p5::create_wire_edge_from_curve(kernel, model, input, interval)
+        // under the primitive's own notification environment, like every face it
+        // builds, so the edge's curve is owned by the edge's identity in the result
+        // (upstream: `pCurve->SetOwner(pEdge)`; #1671)
+        let edge = self.with_brep_mut(brep, |kernel, model, _, env| {
+            crate::topology::brep::p5::create_wire_edge_from_curve_notified(
+                kernel, model, input, interval, env,
+            )
         })?;
         *curve = None;
         Ok(edge)
     }
-    /// Split a surface at G1 discontinuities and append its faces
+    /// Split a surface at G1 discontinuities and return its faces in `faces`
     /// (`SmBrep::CreateFacesFromSurface` with `SM_CT_G1`, as at every call site).
+    /// `faces` is reset first, as upstream's `rNewFaces.ReSet()`, so a caller reusing
+    /// one list across calls gets only this surface's faces.
     fn surface_faces(
         &mut self,
         brep: BrepId,
@@ -110,6 +117,7 @@ pub trait PrimitiveAccess: SweepAccess {
         domain: Extent2d,
         faces: &mut Vec<FaceId>,
     ) -> Result<()> {
+        faces.clear();
         let made = with_face_env(self, brep, |kernel, model, fenv| {
             crate::topology::brep::p8::create_faces_from_surface(
                 kernel,
@@ -199,15 +207,15 @@ pub trait PrimitiveAccess: SweepAccess {
             crate::query::face::p1::calculate_bounding_box(kernel, model, face.1, false)
         })
     }
-    /// Run `query::face::p2::curve_on_classify` with caller-resolved object handles;
-    /// report whether any interval midpoint is `SM_PC_FACE`.
+    /// Run `query::face::p2::curve_on_classify_mut` on the face's B-rep with
+    /// caller-resolved object handles; report whether any interval midpoint is
+    /// `SM_PC_FACE`.
     fn axis_inside_face(&mut self, face: FaceRef, axis: &Curve) -> Result<bool> {
-        crate::sweep::topology_sweep::store::classification::axis_inside_face(
-            self.kernel(face.0)?,
-            self.brep(face.0)?,
-            face.1,
-            axis,
-        )
+        self.with_brep_mut(face.0, |kernel, model, _, _| {
+            crate::sweep::topology_sweep::store::classification::axis_inside_face(
+                kernel, model, face.1, axis,
+            )
+        })
     }
     /// Linear cap stitch: callback, fast edge compare, no vertex-edge splits,
     /// non-manifold mode, region nesting, default targets and tolerance.

@@ -57,8 +57,10 @@
 //! | [`concat_evals`]                                       | `smvol_ConcatEvals`                              |
 //!
 //! Deviations:
+//! - **WR-3.** The bounded rectilinear line-domain check requires both endpoints
+//!   with `Kernel::fixes.extent3d_contains_both_segment_endpoints`; default is upstream OR.
 //! - **Nesting.** `with_maps` and `add_next_map` return `InvalidInput` when the next-map chain would nest
-//!   deeper than [`MAX_GEOMETRY_NESTING`](crate::surface::surface::p2::MAX_GEOMETRY_NESTING)
+//!   deeper than [`MAX_GEOMETRY_NESTING`]
 //!   (32; upstream fixtures nest at most 3), which bounds the recursive dispatch,
 //!   cloning and dropping of nested geometry (no limit upstream).
 //! - **Kinds.** The class hierarchy is the [`VolumeKind`] enum: [`VolumeKind::Base`]
@@ -120,7 +122,7 @@ use crate::geom::matrix::Matrix;
 use crate::geom::object::{NotifyOperation, ObjectRef};
 use crate::geom::transform::{Transform, MAX_DERIV as GW_MAX_DERIV};
 use crate::geom::vector3d::{Point3, Vec3};
-use crate::kernel::Kernel;
+use crate::kernel::{Kernel, UpstreamFixes};
 use crate::math::{max2, EFF_ZERO, EFF_ZERO_SQ};
 use crate::surface::b_spline_volume::{BSplineVolume, VolumeParam};
 use crate::surface::bend_volume::BendVolume;
@@ -198,6 +200,8 @@ pub enum VolumeKind {
 /// Options of the compound evaluations (`Evaluate`, `Map`, `EvaluateSimple`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvalOptions {
+    /// Opt-in corrections copied from the calling kernel and preserved through next maps.
+    pub fixes: UpstreamFixes,
     /// `bUFromLeft`, `bVFromLeft`, `bWFromLeft`: evaluate a point on an interval
     /// boundary in the upper (`true`) or lower interval, per direction.
     pub from_left: [bool; 3],
@@ -210,9 +214,10 @@ pub struct EvalOptions {
 }
 
 impl Default for EvalOptions {
-    /// Everything `true` (`MapPoint`'s arguments and upstream's defaults).
+    /// Upstream arguments `true`, with all opt-in corrections disabled.
     fn default() -> Self {
         Self {
+            fixes: UpstreamFixes::default(),
             from_left: [true; 3],
             non_zero_tangents: true,
             do_zero_sampling: true,
@@ -368,7 +373,7 @@ impl Volume {
     /// # Errors
     ///
     /// `InvalidInput` when the volume would hold more than
-    /// [`MAX_GEOMETRY_NESTING`](crate::surface::surface::p2::MAX_GEOMETRY_NESTING) next maps.
+    /// [`MAX_GEOMETRY_NESTING`] next maps.
     pub fn with_maps(
         kind: VolumeKind,
         orient: Option<Transform>,
@@ -670,7 +675,7 @@ impl Volume {
     ///
     /// The failed `Copy` of `next` when it is added here; `InvalidInput` (nothing
     /// is added) when the chain would hold more than
-    /// [`MAX_GEOMETRY_NESTING`](crate::surface::surface::p2::MAX_GEOMETRY_NESTING) next maps.
+    /// [`MAX_GEOMETRY_NESTING`] next maps.
     pub fn add_next_map(&mut self, next: Self, owner_flag: u64) -> Result<()> {
         // (port) bound the chain: `next` lands below every map already in it
         let mut depth = 1;
@@ -803,7 +808,7 @@ impl Volume {
         with_compounding: bool,
     ) -> Result<bool> {
         // pass the call along
-        let mut is_in = self.is_line_in_param_domain_simple(start, end)?;
+        let mut is_in = self.is_line_in_param_domain_simple(k, start, end)?;
 
         // when asked - check compounded volumes as well
         if let (true, true, Some(next)) = (is_in, with_compounding, self.next_map.as_deref()) {
@@ -1147,7 +1152,7 @@ impl Volume {
     ///
     /// Those of [`Volume::transform_simple`]. Appending a map is refused when it
     /// would nest deeper than
-    /// [`MAX_GEOMETRY_NESTING`](crate::surface::surface::p2::MAX_GEOMETRY_NESTING)
+    /// [`MAX_GEOMETRY_NESTING`]
     /// (including the enclosing curve/surface).
     pub fn transform(&mut self, rotate_n_move: &Axis2Placement, scale: Option<Vec3>) -> Result<()> {
         self.transform_at_depth(rotate_n_move, scale, 0)
@@ -1257,7 +1262,9 @@ impl Volume {
             )),
             VolumeKind::Transform(t) => t.evaluate_simple(param_point, n),
             VolumeKind::BSpline(b) => b.evaluate_simple(param_point, n, opts),
-            VolumeKind::Twist(t) => t.evaluate_simple(param_point, n),
+            VolumeKind::Twist(t) => {
+                t.evaluate_simple_impl(param_point, n, opts.fixes.twist_simple_duw_sign)
+            }
             VolumeKind::Unbend(u) => u.evaluate_simple(param_point, n),
             VolumeKind::Bend(b) => b.evaluate_simple(param_point, n),
         }
@@ -1368,21 +1375,30 @@ impl Volume {
 
     /// Whether the parameter segment is in the natural domain (always, unbounded;
     /// upstream's `ContainsLineSeg3d` tests either end) (`IsLineInParamDomainSimple`,
-    /// virtual).
+    /// virtual). With `extent3d_contains_both_segment_endpoints` (WR-3), bounded
+    /// rectilinear domains require both endpoints inside instead.
     ///
     /// # Errors
     ///
     /// [`SolidError::Unported`] for the unported kinds.
-    pub fn is_line_in_param_domain_simple(&self, start: Point3, end: Point3) -> Result<bool> {
+    pub fn is_line_in_param_domain_simple(
+        &self,
+        k: &Kernel,
+        start: Point3,
+        end: Point3,
+    ) -> Result<bool> {
         match &self.kind {
             VolumeKind::Twist(t) => Ok(t.is_line_in_param_domain_simple()),
             VolumeKind::Unbend(u) => Ok(u.is_line_in_param_domain_simple(start, end)),
             VolumeKind::Bend(b) => Ok(b.is_line_in_param_domain_simple(start, end)),
             _ => {
                 if self.is_bounded_simple()? {
-                    return Ok(self
-                        .natural_param_domain()?
-                        .contains_line_seg(start, end, 0.0));
+                    let domain = self.natural_param_domain()?;
+                    return Ok(if k.fixes.extent3d_contains_both_segment_endpoints {
+                        domain.contains_point(start, 0.0) && domain.contains_point(end, 0.0)
+                    } else {
+                        domain.contains_line_seg(start, end, 0.0)
+                    });
                 }
                 Ok(true)
             }

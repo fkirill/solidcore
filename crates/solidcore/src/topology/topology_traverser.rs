@@ -8,6 +8,7 @@
 //! | [`collect_faces`] | `SmTopologyTraverser::CollectFaces`, `sm_CollectFaces` |
 //! | [`collect_wire_edges`] | `SmTopologyTraverser::CollectWireEdges`, `sm_CollectWires` |
 //! | [`closure_traversal`], [`faceuse_traversal`] | `ClosureTraversal`, `FaceuseTraversal` |
+//! | [`closure_traversal_from_both_sides`] | `ClosureTraversalFromBothSides` (fork tangency-labs/smlib@69c5198, WR-584) |
 //! | [`remove_shell`], [`faceuse_shell_replacement`] | `RemoveShell`, `FaceuseShellReplacement` |
 //! | [`shell_traversal`], `shell_connectivity` (private) | `ShellTraversal`, `sm_ShellConnectivity` |
 //! | [`is_inner_shell`] | `IsInnerShell`, `IsOdd` |
@@ -15,20 +16,27 @@
 //! | [`face_edges`] | `SmFace::GetEdges` (CO-PORTED, `topology.face_p4`, default arguments) |
 //!
 //! Deviations: stateless constructor/destructor become free functions. Marks are
-//! [`Marks`] records alongside one B-rep, using the kernel context's counters;
+//! [`Marks`] records alongside one B-rep, one slot per arena index of each kind
+//! (upstream keeps the record in the object itself), using the kernel context's counters;
 //! pointers become typed ids. Null dereferences and `NoMark` on cyclic traversals
 //! return errors. Wire recursion becomes explicit continuation frames, in exactly
 //! the upstream order (no input-dependent call-stack growth). Outputs remain mutable
 //! arrays where early returns preserve optional arrays upstream. Shell ownership
 //! moves through `topology::shell` (`transfer_children`, `move_faceuse`: the
 //! `Remove` / `PostInsert` statuses that `FaceuseShellReplacement` ignores cannot
-//! fail on a consistent B-rep, so an inconsistent one is an error). The ray/face
-//! intersections (`SmFace::GlobalLineIntersect`) classify on a copy of the B-rep.
-//! `IsInnerShell` keeps each target face surface's solve cache for the whole call
+//! fail on a consistent B-rep, so an inconsistent one is an error). `IsInnerShell`'s
+//! face samples and ray/face intersections (`SmFace::GetPointsInFace`,
+//! `SmFace::GlobalLineIntersect`) run on the caller's B-rep, which keeps the UV trim
+//! curves they make, as upstream's `const` queries leave them. `IsInnerShell` keeps each target face surface's solve cache for the whole call
 //! (upstream's surface keeps its cache across the rays); the port otherwise builds one
 //! per intersection, and a failed build is kept too instead of being retried on every
 //! ray (the build is deterministic, so a retry fails the same way).
 //! Existing co-ported accessors are reused.
+//! `ClosureTraversalFromBothSides` is not in the pinned upstream: it is the fork's
+//! (tangency-labs/smlib@69c5198), used only under
+//! [`UpstreamFixes::boolean_new_face_closure_both_sides`](crate::kernel::UpstreamFixes::boolean_new_face_closure_both_sides)
+//! (WR-584). Its `std::unordered_map` side table becomes a vector indexed by face-use
+//! arena slot (lookups only, as the fork; no iteration).
 
 use std::collections::BTreeMap;
 
@@ -67,8 +75,11 @@ pub enum Entity {
 }
 
 /// Topology mark records for one B-rep; retain across calls using the same context.
+///
+/// One optional record per arena slot of each entity kind, as upstream keeps the
+/// record in the object: lookups are indexed, not searched.
 #[derive(Debug, Clone, Default)]
-pub struct Marks(BTreeMap<Entity, Topology>);
+pub struct Marks([Vec<Option<Topology>>; 6]);
 
 /// Mark access shared by face traversal and a production topology record store.
 /// Implementations must retain marks across calls under the same kernel context.
@@ -89,22 +100,46 @@ impl FaceTraversalMarks for Marks {
 }
 
 impl Marks {
+    /// The kind table and arena index of `entity`.
+    fn slot(entity: Entity) -> (usize, usize) {
+        match entity {
+            Entity::Face(x) => (0, x.index() as usize),
+            Entity::Edge(x) => (1, x.index() as usize),
+            Entity::Vertex(x) => (2, x.index() as usize),
+            Entity::Faceuse(x) => (3, x.index() as usize),
+            Entity::Vertexuse(x) => (4, x.index() as usize),
+            Entity::Shell(x) => (5, x.index() as usize),
+        }
+    }
+
+    /// The record of `entity`, made default first if it has none.
+    fn record_mut(&mut self, entity: Entity) -> Option<&mut Topology> {
+        let (kind, i) = Self::slot(entity);
+        let table = self.0.get_mut(kind)?;
+        if table.len() <= i {
+            table.resize(i + 1, None);
+        }
+        Some(table.get_mut(i)?.get_or_insert_with(Topology::default))
+    }
+
     /// Import the caller's persistent topology record before traversal.
     pub fn set_record(&mut self, entity: Entity, record: Topology) {
-        self.0.insert(entity, record);
+        if let Some(r) = self.record_mut(entity) {
+            *r = record;
+        }
     }
 
     /// The updated topology record, including marks written before an error.
     #[must_use]
     pub fn record(&self, entity: Entity) -> Option<&Topology> {
-        self.0.get(&entity)
+        let (kind, i) = Self::slot(entity);
+        self.0.get(kind)?.get(i)?.as_ref()
     }
 
     /// Whether `entity` carries the kernel's current `mark` value.
     #[must_use]
     pub fn is_marked(&self, k: &Kernel, entity: Entity, mark: MarkType) -> bool {
-        self.0
-            .get(&entity)
+        self.record(entity)
             .copied()
             .unwrap_or_default()
             .is_marked(&k.context, mark)
@@ -112,10 +147,9 @@ impl Marks {
 
     /// Set `entity` to the kernel's current `mark` value.
     pub fn mark(&mut self, k: &Kernel, entity: Entity, mark: MarkType) {
-        self.0
-            .entry(entity)
-            .or_default()
-            .mark(Some(&k.context), mark);
+        if let Some(r) = self.record_mut(entity) {
+            r.mark(Some(&k.context), mark);
+        }
     }
 }
 
@@ -350,6 +384,83 @@ pub fn closure_traversal(
     faceuse_traversal(k, b, marks, start, lock.mark_type(), faceuses)
 }
 
+/// `ClosureTraversalFromBothSides` (fork tangency-labs/smlib@69c5198, WR-584):
+/// [`closure_traversal`]'s answer, found by two breadth-first searches through edge-use
+/// radials, one from `start` and one from its mate, expanding one face use of each in
+/// turn. The searches meet (the mate is reachable: not closed) or one side runs out
+/// first (closed). Visits at most twice the face uses on the smaller side; marks
+/// nothing and claims no mark. A face with a lamina edge is not closed. A missing
+/// radial or radial face use is skipped, as the fork does.
+///
+/// # Errors
+///
+/// A missing face or mate (`NER` upstream), dangling ids, or those of the lamina test.
+pub fn closure_traversal_from_both_sides(b: &Brep, start: FaceuseId) -> Result<bool> {
+    // A face with any lamina edges is not closed (as ClosureTraversal).
+    let f = required(b.faceuse(start)?.face)?;
+    if has_lamina_edge(b, f)? {
+        return Ok(false);
+    }
+    let mate = required(b.faceuse(start)?.mate)?;
+
+    // the side (0 = from the face use, 1 = from its mate) each visited face use was
+    // reached from, by arena slot
+    let mut side: Vec<Option<usize>> = Vec::new();
+    let set_side = |side: &mut Vec<Option<usize>>, fu: FaceuseId, k: usize| {
+        let i = fu.index() as usize;
+        if side.len() <= i {
+            side.resize(i + 1, None);
+        }
+        if let Some(slot) = side.get_mut(i) {
+            *slot = Some(k);
+        }
+    };
+    set_side(&mut side, start, 0);
+    set_side(&mut side, mate, 1);
+
+    // a breadth-first queue per side: the face uses still to expand are [head[k], len)
+    let mut queue: [Vec<FaceuseId>; 2] = [vec![start], vec![mate]];
+    let mut head = [0usize; 2];
+
+    loop {
+        for k in 0..2 {
+            let (Some(q), Some(h)) = (queue.get(k), head.get_mut(k)) else {
+                return Err(SolidError::invalid_input(OP, "closure search side"));
+            };
+            // this side has nothing left: its component does not hold the other start
+            let Some(&fu) = q.get(*h) else {
+                return Ok(true);
+            };
+            *h += 1;
+
+            // for every faceuse->loopuse->edgeuse: the edgeuse's radial neighbour's faceuse
+            let mut found = Vec::new();
+            for &lu in &b.faceuse(fu)?.loopuses {
+                for edgeuse in eu::loopuse_edgeuses(b, lu)? {
+                    let Some(radial) = eu::radial(b, edgeuse)? else {
+                        continue;
+                    };
+                    let Some(neighbor) = eu::faceuse(b, radial)? else {
+                        continue;
+                    };
+                    match side.get(neighbor.index() as usize).copied().flatten() {
+                        None => {
+                            set_side(&mut side, neighbor, k);
+                            found.push(neighbor);
+                        }
+                        // the two searches meet: the mate is reachable, the shell is open
+                        Some(other) if other != k => return Ok(false),
+                        Some(_) => {}
+                    }
+                }
+            }
+            if let Some(q) = queue.get_mut(k) {
+                q.extend(found);
+            }
+        }
+    }
+}
+
 /// Transfer a shell's children to its replacement (`RemoveShell`: `SER` on
 /// `SmShell::TransferChildrenTo` with no wire-edge list).
 ///
@@ -383,7 +494,7 @@ pub fn faceuse_shell_replacement(
 fn shell_connectivity(
     k: &Kernel,
     b: &Brep,
-    marks: &mut Marks,
+    marks: &mut (impl FaceTraversalMarks + ?Sized),
     start: VertexuseId,
     shell: ShellId,
     mark: MarkType,
@@ -468,6 +579,24 @@ pub fn shell_traversal(
     marks: &mut Marks,
     start: VertexId,
     shell: ShellId,
+    edgeuses: Option<&mut Vec<EdgeuseId>>,
+    faceuses: Option<&mut Vec<FaceuseId>>,
+    lock: &MarkLock,
+) -> Result<()> {
+    shell_traversal_with_marks(k, b, marks, start, shell, edgeuses, faceuses, lock)
+}
+
+/// Traverse shell connectivity through borrowed retained topology marks.
+///
+/// # Errors
+/// Those of [`shell_traversal`]; successful mark writes remain on failure.
+#[allow(clippy::too_many_arguments)]
+pub fn shell_traversal_with_marks(
+    k: &mut Kernel,
+    b: &Brep,
+    marks: &mut (impl FaceTraversalMarks + ?Sized),
+    start: VertexId,
+    shell: ShellId,
     mut edgeuses: Option<&mut Vec<EdgeuseId>>,
     mut faceuses: Option<&mut Vec<FaceuseId>>,
     lock: &MarkLock,
@@ -529,7 +658,7 @@ fn line_parameters(
         face.surface
             .as_ref()
             .ok_or_else(|| SolidError::invalid_input(OP, "ray target face without surface"))?
-            .natural_uv_domain(),
+            .natural_uv_domain_with_nurb(k)?,
     );
     let solutions = crate::topology::face::p4::global_line_intersect_held(
         k, b, f, surface, held, &uv_domain, origin, direction, None, false, tol,
@@ -546,15 +675,12 @@ fn line_parameters(
 /// failures skip the face, as upstream).
 /// An empty or inconclusive set returns the upstream `SM_ERR`.
 ///
-/// The rays run on one copy of `b`, so the lazy cache updates of the face
-/// classifications carry over from ray to ray as upstream's do, and are dropped at the
-/// end (`b` is the caller's shared B-rep).
-pub fn is_inner_shell(k: &mut Kernel, b: &Brep, faceuses: &[FaceuseId]) -> Result<bool> {
+/// The rays and face samples run on `b` itself, so the UV trim curves their face
+/// classifications create stay on the B-rep, as upstream's `const` queries leave them.
+pub fn is_inner_shell(k: &mut Kernel, b: &mut Brep, faceuses: &[FaceuseId]) -> Result<bool> {
     if faceuses.is_empty() {
         return Err(SolidError::sm_err(OP));
     }
-    let mut scratch = b.clone();
-    let b = &mut scratch;
     let mut samples = 3;
     if faceuses.len() < 6 {
         samples *= 2;
@@ -569,9 +695,9 @@ pub fn is_inner_shell(k: &mut Kernel, b: &Brep, faceuses: &[FaceuseId]) -> Resul
     let mut caches: BTreeMap<FaceId, HeldSolveCache<RaySurface>> = BTreeMap::new();
     for &source in faceuses {
         let source = b.faceuse(source)?;
-        let f = required(source.face)?;
-        let mut points = face::points_in_face(k, &*b, f, samples)?.pv;
-        if source.orientation == OrientType::Opposite {
+        let (f, orientation) = (required(source.face)?, source.orientation);
+        let mut points = face::points_in_face(k, b, f, samples)?.pv;
+        if orientation == OrientType::Opposite {
             for pair in points.chunks_exact_mut(2) {
                 if let Some(normal) = pair.get_mut(1) {
                     *normal *= -1.0;

@@ -338,6 +338,10 @@ pub struct LocalSolve1d {
     pub upper_bound_hits: u64,
     /// Why the last solve stopped.
     pub termination_reason: TerminationReason,
+    /// Not upstream (WR-253, tangency-labs/solidcore#481): `SolveOscillating` takes a
+    /// sign change only from an interior guess that evaluated (`false`, the default:
+    /// upstream also reads a failed guess's leftover `F`).
+    failed_guess_no_sign_change: bool,
 }
 
 impl Default for LocalSolve1d {
@@ -373,6 +377,7 @@ impl LocalSolve1d {
             lower_bound_hits: UNDEF_ULONG,
             upper_bound_hits: UNDEF_ULONG,
             termination_reason: TerminationReason::Undefined,
+            failed_guess_no_sign_change: false,
         }
     }
 
@@ -422,6 +427,14 @@ impl LocalSolve1d {
     /// (`SetSolutionInterval`).
     pub fn set_solution_interval(&mut self, interval: Extent1d) {
         self.interval = interval;
+    }
+
+    /// Not upstream (WR-253, tangency-labs/solidcore#481): whether `SolveOscillating`
+    /// ignores an interior guess whose evaluation failed when it looks for a sign change
+    /// (`true`), instead of reading the `F` the failed evaluation left behind (`false`,
+    /// upstream and the default).
+    pub fn set_failed_guess_no_sign_change(&mut self, on: bool) {
+        self.failed_guess_no_sign_change = on;
     }
 
     /// Selects the algorithm (`SetSolverAlgorithm`).
@@ -731,6 +744,7 @@ impl LocalSolve1d {
             let prev_t = self.prev1.t;
             let curr_f = self.curr.f;
 
+            let mut evaluated_sign_change = false;
             for g in GUESSES {
                 let mid_t = prev_t + g * (curr_t - prev_t);
                 temp.t = mid_t;
@@ -743,11 +757,18 @@ impl LocalSolve1d {
                     best_interior_t = mid_t;
                 }
                 if temp.f * curr_f <= 0.0 {
+                    evaluated_sign_change = true;
                     break; // opposite sign
                 }
             }
 
-            if temp.f * curr_f <= 0.0 {
+            // (upstream tests the last guess's `F`, failed or not: WR-253)
+            let sign_change = if self.failed_guess_no_sign_change {
+                evaluated_sign_change
+            } else {
+                temp.f * curr_f <= 0.0
+            };
+            if sign_change {
                 // Curr and prev have the same sign, opposite to mid: pick the end on
                 // the side of the given guess.
                 let pick_curr = if guess_t < temp.t {
@@ -1239,6 +1260,114 @@ mod tests {
         let mut out = FunctionValue::default();
         Cycle.evaluate(LAST_GUESS, &mut out, true).unwrap();
         assert!(out.f > 0.9);
+    }
+
+    /// tangency-labs/solidcore#481 (WR-253): with the opt-in, the failed last guess is
+    /// no sign change, and the solve finds nothing, as on the clean function.
+    #[test]
+    fn issue_481_failed_guess_is_no_sign_change() {
+        let mut s = LocalSolve1d::with_interval(Extent1d::from_min_max(-3.0, 3.0), false);
+        s.set_failed_guess_no_sign_change(true);
+        let r = s.solve_it(&mut CycleFailingAtLastGuess, 0.0, 1e-9).unwrap();
+        assert!(!r.found, "{r:?}");
+        assert_ne!(r.t.to_bits(), LAST_GUESS.to_bits());
+        assert_ne!(s.lower_bracket_t.to_bits(), LAST_GUESS.to_bits());
+    }
+
+    /// A failed final sample must not replace the valid, same-sign samples with
+    /// a fabricated zero (WR-253 / #481).
+    #[test]
+    fn failed_guess_does_not_supply_a_sign_change() {
+        let interval = Extent1d::from_min_max(-3.0, 3.0);
+        let mut clean_solver = LocalSolve1d::with_interval(interval, false);
+        let clean = clean_solver.solve_it(&mut Cycle, 0.0, 1e-9).unwrap();
+        assert!(!clean.found);
+        let mut solver = LocalSolve1d::with_interval(interval, false);
+        solver.set_failed_guess_no_sign_change(true);
+        let result = solver
+            .solve_it(&mut CycleFailingAtLastGuess, 0.0, 1e-9)
+            .unwrap();
+        assert!(!result.found);
+        assert_eq!(result.t.to_bits(), clean.t.to_bits());
+        assert_eq!(solver.curr.f, clean_solver.curr.f);
+        assert_eq!(
+            solver.termination_reason(),
+            TerminationReason::UnableToConverge
+        );
+        assert_eq!(solver.have_lower_bracket, clean_solver.have_lower_bracket);
+        assert_eq!(solver.have_upper_bracket, clean_solver.have_upper_bracket);
+    }
+
+    #[test]
+    fn failed_interior_samples_cannot_create_a_bracket() {
+        struct FailedSamples(f64);
+        impl EvalFunction for FailedSamples {
+            fn evaluate(&mut self, t: f64, out: &mut FunctionValue, _: bool) -> Result<()> {
+                if [0.25, 0.75, 0.13, 0.38, 0.82, 0.87, 0.01, 0.99].contains(&t) {
+                    out.f = self.0;
+                    return Err(sm_err("test: failed interior sample"));
+                }
+                out.f = t * t + 1.0;
+                out.f_prime = 2.0 * t;
+                out.found_answer = false;
+                Ok(())
+            }
+        }
+        for failed_value in [0.0, -1.0] {
+            let mut solver = LocalSolve1d::new();
+            solver.set_failed_guess_no_sign_change(true);
+            solver.prev1 = IterationValue {
+                t: 0.0,
+                f: 1.0,
+                ..IterationValue::default()
+            };
+            solver.curr = IterationValue {
+                t: 1.0,
+                f: 2.0,
+                ..IterationValue::default()
+            };
+            let result = solver
+                .solve_oscillating(&mut FailedSamples(failed_value), 0.9)
+                .unwrap();
+            assert!(!result.found);
+            assert_eq!(solver.curr.f, result.t * result.t + 1.0);
+            assert!(!solver.have_lower_bracket);
+            assert!(!solver.have_upper_bracket);
+        }
+    }
+
+    #[test]
+    fn successful_sample_after_a_failure_can_still_bracket_a_root() {
+        struct FailedQuarter;
+        impl EvalFunction for FailedQuarter {
+            fn evaluate(&mut self, t: f64, out: &mut FunctionValue, _: bool) -> Result<()> {
+                if t == 0.25 {
+                    *out = FunctionValue::default();
+                    return Err(sm_err("test: failed quarter sample"));
+                }
+                out.f = (t - 0.75) * (t - 0.75) - 0.01;
+                out.f_prime = 2.0 * (t - 0.75);
+                out.found_answer = false;
+                Ok(())
+            }
+        }
+        let mut solver = LocalSolve1d::new();
+        solver.set_failed_guess_no_sign_change(true);
+        solver.prev1 = IterationValue {
+            t: 0.0,
+            f: 0.5525,
+            ..IterationValue::default()
+        };
+        solver.curr = IterationValue {
+            t: 1.0,
+            f: 0.0525,
+            ..IterationValue::default()
+        };
+        solver.set_desired_accuracy(1e-10);
+        let result = solver.solve_oscillating(&mut FailedQuarter, 0.9).unwrap();
+        assert!(result.found);
+        assert!((result.t - 0.85).abs() < 1e-8);
+        assert!(solver.curr.f.abs() < 1e-10);
     }
 
     #[test]

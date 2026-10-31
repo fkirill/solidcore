@@ -3,32 +3,37 @@
 //!
 //! The C++ side builds a real `SmBrep` per call with the shared topology fixture (an
 //! upstream `.smb` file, a wire edge, a one-face B-rep or the `my_test_topology` wire
-//! network), normalised as the `topology.brep_p2` shim does, and runs one member of the
-//! unit (the constructors and `SmApiBrepCopy` too). The Rust side imports the graph
-//! the `topology.brep_p2` shim exports for the same input (the `topology.vertexuse`
-//! importer), restores what the import cannot carry (the B-rep tolerance, infinite
-//! region, region list head, editing flag, each vertex's vertex use order, the
-//! geometry owners and each face's upward face use), runs the port and writes the
-//! same output layout (`out`).
+//! network), as the `topology.brep_p2` shim builds it, and runs one member of the unit
+//! (the constructors and `SmApiBrepCopy` too) on its real geometry, analytic surfaces
+//! and curves included. The Rust side builds a wire edge, face or network source itself
+//! ([`crate::own_builder`] under the `topology.brep_p2` shim's conventions) and reads an
+//! `.smb` file with the Rust reader, renumbered the same way; the B-rep tolerance,
+//! infinite region, region list head, editing flag, each vertex's vertex use order, the
+//! geometry owners and each face's upward face use are the Rust build's own. No C++
+//! export reaches the Rust side. It runs the port and writes the same output layout
+//! (`out`).
 //!
 //! Entity selectors are taken modulo the matching entity count (`-1` selects null);
 //! an op that needs an entity the B-rep lacks is skipped on both sides (`no target`).
-//! `Merge` / `CopyVertices` target a second build of the same B-rep (a second import
+//! `Merge` / `CopyVertices` target a second build of the same B-rep (a second build
 //! on the Rust side), whose objects the Rust side notifies under identities of their
 //! own ([`source_key_of`]). `DeleteFace` always passes a deleted list
 //! (`pOptDeletedEdgesVertices`); the header default `NULL` only skips its `Add`s and
-//! is not compared.
+//! is not compared. `CopyVertices` also appends the source and existing destination
+//! vertex coordinates before/after copying, then the returned vertices' destination
+//! walk indices and coordinates in returned order.
 //!
 //! `Orient` outputs three values ([`split_orient`]): `out` (status, flag, face domains
 //! and upward face uses, counts), `swapped` (each face's `SmFace::SwapUV` `POST_EDIT`
 //! count, from that side's own tracker events) and `tracker` (the tracker's lists and
-//! events). `out` and `swapped` are always compared. A side whose events show a swap
-//! leaves out `tracker`: upstream the surface's own `SwapUV` notifies `SM_NO_PRE_EDIT` /
-//! `SM_NO_POST_EDIT` on the surface (`SmBSplineSurface::SwapUV` through `SetCanonical`,
-//! `SmBSplineSurface.cpp:4585`/`:4592`; `SmOffsetSurface` through its base surface;
-//! `SmSrfInVolume` itself), which the tracker records and turns into a `Chg` of the
-//! owning face, and a Rust `Surface` has no notification identity yet to send it under.
-//! A swap on one side only differs in `swapped` (and in `tracker`'s presence).
+//! events), all compared. A swap's surface edit is in `tracker`: upstream the surface's
+//! own `SwapUV` notifies `SM_NO_PRE_EDIT` / `SM_NO_POST_EDIT` on the surface
+//! (`SmBSplineSurface::SwapUV` through `SetCanonical`, `SmBSplineSurface.cpp:4585`/`:4592`;
+//! `SmOffsetSurface` through its base surface; `SmSrfInVolume` itself), which the
+//! tracker records and turns into a `Chg` of the owning face. The Rust side issues each
+//! pre-op face surface its identity on the tracked context with the face as its owner,
+//! and the port's `SwapUV` (`face::p1::swap_uv_with_notifications`) sends the surface's
+//! notifications under it; a surface is other geometry (`-30 n`) on both sides.
 
 use std::collections::BTreeMap;
 
@@ -37,7 +42,7 @@ use serde_json::Value;
 
 use solidcore::curve::curve::{Curve as SmCurve, CurveKind};
 use solidcore::error::SM_ERR;
-use solidcore::geom::attribute::{AttributeStore, ObjectKey};
+use solidcore::geom::attribute::{Attribute, AttributeStore, Behavior, ObjectKey};
 use solidcore::geom::context::Context;
 use solidcore::geom::extent1d::Extent1d;
 use solidcore::geom::object::ObjectRef;
@@ -67,7 +72,7 @@ use solidcore_ffi::units::topology_brep_p3::{self as ffi, Op};
 use solidcore_ffi::units::topology_vertexuse::counts;
 
 use super::topology_vertexuse::{
-    gen_brep, gen_curve, import, path_of, push_curve, push_surface, BrepIn, CrvIn,
+    gen_brep, gen_curve, path_of, push_curve, push_surface, BrepIn, CrvIn,
 };
 use crate::case::CaseContext;
 use crate::runner::default_cases;
@@ -139,6 +144,31 @@ enum OpIn {
         offset: f64,
     },
     ApiCopyNull,
+    /// Every face and edge tagged with its own long attribute (behaviour `behavior`, an
+    /// `SmAttributeBehaviorType` value), then `SmApiBrepCopy`; also compares the
+    /// attributes of the copy's and the source's faces and edges (issue #1462). With
+    /// `shared_naming` the Rust copy names its source by the copy's own naming
+    /// ([`key_of`], not [`source_key_of`]), the B-rep's own naming a caller reaches for
+    /// (the C++ side has no names).
+    AttributedCopy {
+        #[serde(default)]
+        behavior: u8,
+        #[serde(default)]
+        shared_naming: bool,
+    },
+    /// Every face and edge tagged as for `AttributedCopy`, then `MergeBrep` of the B-rep into
+    /// a second build of it; compares the second build's and the source's attributes (does
+    /// the merge carry the merged B-rep's attributes?).
+    AttributedMerge {
+        #[serde(default = "yes")]
+        analytics: bool,
+        #[serde(default)]
+        behavior: u8,
+    },
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +243,16 @@ fn op_args(op: &OpIn, c: &[usize; 10]) -> Result<Option<(Op, Vec<f64>)>, Harness
         OpIn::TurnNurbsOffset { offset } => (Op::TurnNurbsOffset, vec![*offset]),
         OpIn::Copy { analytics, api } => (Op::Copy, vec![flag(*analytics), flag(*api)]),
         OpIn::Merge { analytics } => (Op::Merge, vec![flag(*analytics)]),
+        OpIn::AttributedMerge {
+            analytics,
+            behavior,
+        } => (
+            Op::AttributedMerge,
+            vec![flag(*analytics), f64::from(*behavior)],
+        ),
+        OpIn::AttributedCopy { behavior, .. } => {
+            (Op::AttributedCopy, vec![f64::from(*behavior)])
+        }
         OpIn::CopyVertices { vertices } => {
             let mut v = vec![vertices.len() as f64];
             for &s in vertices {
@@ -346,7 +386,7 @@ fn run_cpp(i: &Inputs) -> Result<Output, HarnessError> {
 
 /// The identity each entity is notified and attributed under: its type code and
 /// `(kind << 32) | (1 + index)`, so records of different kinds never share a key.
-fn key_of(e: EntityRef) -> ObjectRef {
+pub(super) fn key_of(e: EntityRef) -> ObjectRef {
     let (kind, type_code, i) = match e {
         EntityRef::Region(x) => (1u64, 16012, x.index()),
         EntityRef::Shell(x) => (2, 16013, x.index()),
@@ -366,9 +406,27 @@ fn key_of(e: EntityRef) -> ObjectRef {
     }
 }
 
+/// The entity a [`key_of`] key names (`None` for another key).
+fn entity_of_key(key: ObjectKey) -> Option<EntityRef> {
+    let i = u32::try_from((key.0 & 0xffff_ffff).checked_sub(1)?).ok()?;
+    Some(match key.0 >> 32 {
+        1 => EntityRef::Region(RegionId::from_index(i)),
+        2 => EntityRef::Shell(ShellId::from_index(i)),
+        3 => EntityRef::Faceuse(FaceuseId::from_index(i)),
+        4 => EntityRef::Face(FaceId::from_index(i)),
+        5 => EntityRef::Loopuse(LoopuseId::from_index(i)),
+        6 => EntityRef::Loop(LoopId::from_index(i)),
+        7 => EntityRef::Edgeuse(EdgeuseId::from_index(i)),
+        8 => EntityRef::Edge(EdgeId::from_index(i)),
+        9 => EntityRef::Vertexuse(VertexuseId::from_index(i)),
+        10 => EntityRef::Vertex(VertexId::from_index(i)),
+        _ => return None,
+    })
+}
+
 /// The identity of the source B-rep's entities in a copy or merge into another B-rep
 /// (its ids overlap the destination's, which are notified under [`key_of`]).
-fn source_key_of(e: EntityRef) -> ObjectRef {
+pub(super) fn source_key_of(e: EntityRef) -> ObjectRef {
     let r = key_of(e);
     ObjectRef {
         type_code: r.type_code,
@@ -376,89 +434,51 @@ fn source_key_of(e: EntityRef) -> ObjectRef {
     }
 }
 
-/// The Rust B-rep of the case (with the shim's extras restored).
-fn rust_brep(path: &str, h: &[f64], c: &[usize; 10]) -> Result<Brep, HarnessError> {
-    let export = ffi2::eval(ffi2::Op::Export, path, h).map_err(|e| ffi_err(&e))?;
-    let (mut b, exact) = import(&export)?;
-    if exact.iter().any(|e| !e) {
-        return Err(harness("a face surface was not imported exactly"));
-    }
-    let ex = ffi2::eval(ffi2::Op::Extras, path, h).map_err(|e| ffi_err(&e))?;
-    let mut at = 1usize;
-    let mut next = || -> Result<f64, HarnessError> {
-        let v = ex
-            .get(at)
-            .copied()
-            .ok_or_else(|| harness("extras too short"))?;
-        at += 1;
-        Ok(v)
+/// The shim's build conventions (`sc_topology_fixture.h` as the `topology.brep_p2`
+/// shim uses it: the face, edge and vertex lists registered before the traversal,
+/// `GetVertexEdgeGap` in the `init_gaps` walk), with the geometry owned under the arena
+/// identities.
+const CONVENTIONS: crate::own_builder::Conventions<'static> = crate::own_builder::Conventions {
+    prefix_lists: true,
+    vertex_edge_gaps: true,
+    vertex_lists_last: false,
+    ..crate::own_builder::Conventions::EDGEUSE_GRAPH
+};
+
+/// The Rust B-rep of the case and its entity counts, or the build failure's output:
+/// shim-built sources are built by the Rust kernel ([`crate::own_builder`]) and `.smb`
+/// files read by the Rust reader ([`crate::own_reader::file_in_order`]), both in the
+/// shim's traversal order under [`CONVENTIONS`]; the shim's `editing` flag is applied
+/// after. No C++ export reaches the Rust side.
+fn own_brep(
+    k: &mut Kernel,
+    i: &Inputs,
+) -> Result<Result<(Brep, [usize; 10]), Output>, HarnessError> {
+    use crate::own_builder::{build_as, build_status, counts, Built};
+    let built = if let Some(b) = build_as(k, &i.brep, i.validate_only, i.init_gaps, &CONVENTIONS)? {
+        b
+    } else {
+        let BrepIn::File { rebuild, .. } = &i.brep else {
+            return Err(harness("own builder: a non-file source was not built"));
+        };
+        let path = path_of(&i.brep)?;
+        let (vo, gaps) = (i.validate_only, i.init_gaps);
+        crate::own_reader::file_in_order(k, &path, *rebuild, vo, gaps, &CONVENTIONS)?
     };
-    let tol = next()?;
-    let inf = next()?;
-    let head_r = next()?;
-    let editing = next()? != 0.0;
-    b.set_tolerance(tol);
-    b.set_infinite_region((inf >= 0.0).then(|| RegionId::from_index(inf as u32)));
-    b.set_region_list_head((head_r >= 0.0).then(|| RegionId::from_index(head_r as u32)));
-    b.set_editing_enabled(editing);
-    for v in 0..c[9] {
-        let n = next()? as usize;
-        let mut list = Vec::new();
-        for _ in 0..n {
-            let i = next()?;
-            if i < 0.0 {
-                return Err(harness("unregistered vertex use in a vertex list"));
+    match built {
+        Built::Brep(b) => {
+            let mut b = *b;
+            if i.editing >= 0 {
+                b.set_editing_enabled(i.editing != 0);
             }
-            list.push(VertexuseId::from_index(i as u32));
+            let c = counts(&b);
+            Ok(Ok((b, c)))
         }
-        b.vertex_mut(VertexId::from_index(v as u32))
-            .map_err(|e| harness(e.to_string()))?
-            .vertexuses = list;
+        Built::Failed(e) => match Output::unported(&e) {
+            Some(o) => Ok(Err(o)),
+            None => Ok(Err(Output::new().values("out", vec![-1.0, build_status(&e)]))),
+        },
     }
-    // the geometry's owners (set by the B-rep build upstream): the arena identities
-    // (a face surface only when the export says the face owns it)
-    let edge_ids: Vec<EdgeId> = b.edges().ids().collect();
-    for id in edge_ids {
-        if let Some(curve) = b
-            .edge_mut(id)
-            .map_err(|e| harness(e.to_string()))?
-            .curve
-            .as_mut()
-        {
-            let _ = curve.set_owner(
-                Some(arena_identity(CacheObject::Edge(id))),
-                Some(arena_identity(CacheObject::Brep)),
-            );
-        }
-    }
-    let face_ids: Vec<FaceId> = b.faces().ids().collect();
-    for id in face_ids {
-        if let Some(surface) = b
-            .face_mut(id)
-            .map_err(|e| harness(e.to_string()))?
-            .surface
-            .as_mut()
-        {
-            if surface.owner().is_some() {
-                let _ = surface.set_owner(Some(arena_identity(CacheObject::Face(id))));
-            }
-        }
-    }
-    // the shared import leaves `m_pFU` unset: the face's upward (SAME) face use
-    let ups: Vec<(FaceId, FaceuseId)> = b
-        .faceuses()
-        .iter()
-        .filter(|(_, r)| r.orientation == OrientType::Same)
-        .filter_map(|(id, r)| r.face.map(|f| (f, id)))
-        .collect();
-    for (f, fu) in ups {
-        if let Ok(face) = b.face_mut(f) {
-            if face.faceuse.is_none() {
-                face.faceuse = Some(fu);
-            }
-        }
-    }
-    Ok(b)
 }
 
 fn rust_curve(c: &CrvIn) -> Result<BSplineCurve, HarnessError> {
@@ -994,8 +1014,9 @@ fn wrap_in_offsets(k: &Kernel, b: &mut Brep, faces: &[FaceId], d: f64) -> Result
     Ok(())
 }
 
-/// `SmEdge_TYPE`, the type code of an edge's identity.
-const EDGE_TYPE_CODE: i64 = 16016;
+/// The type codes of the identities whose destructions the recorders count:
+/// `SmEdge_TYPE`, `SmEdgeuse_TYPE`, `SmFace_TYPE`, `SmShell_TYPE`.
+const DESTROYED_KINDS: [i64; 4] = [16016, 16005, 16002, 16013];
 
 /// Whether `key` is a geometry identity (the kernel context's range,
 /// `Context::new_geometry_key`; every [`key_of`] key is below it).
@@ -1005,11 +1026,12 @@ const fn is_geometry_key(key: ObjectKey) -> bool {
 
 /// The shim's `GeomRecorder`: a user notify callback that keeps every geometry key a
 /// notification names (the shim's tells geometry from topology while it is live), and
-/// counts the `SM_NO_DESTRUCTION` notifications whose caller is an edge (`~SmEdge`).
+/// counts the `SM_NO_DESTRUCTION` notifications by caller kind: edge, edge use, face,
+/// shell (`~SmEdge`, `~SmEdgeuse`, `~SmFace`, `~SmShell`).
 #[derive(Debug, Default)]
 struct GeomRecorder(
     std::sync::Arc<std::sync::Mutex<Vec<ObjectKey>>>,
-    std::sync::Arc<std::sync::Mutex<u64>>,
+    std::sync::Arc<std::sync::Mutex<[u64; 4]>>,
 );
 
 impl solidcore::geom::context::NotifyCallback for GeomRecorder {
@@ -1021,13 +1043,16 @@ impl solidcore::geom::context::NotifyCallback for GeomRecorder {
         data2: Option<ObjectRef>,
         data3: Option<ObjectRef>,
     ) -> Result<(), SolidError> {
-        if operation == solidcore::geom::object::NotifyOperation::Destruction
-            && caller.type_code == EDGE_TYPE_CODE
-        {
-            *self
-                .1
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        if operation == solidcore::geom::object::NotifyOperation::Destruction {
+            if let Some(i) = DESTROYED_KINDS.iter().position(|&t| t == caller.type_code) {
+                let mut destroyed = self
+                    .1
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(n) = destroyed.get_mut(i) {
+                    *n += 1;
+                }
+            }
         }
         let mut seen = self
             .0
@@ -1179,6 +1204,14 @@ fn run_rust_op(
             owners.push((c, key_of(EntityRef::Edge(e))));
         }
     }
+    // and each face's surface (upstream SetCanonical notifies the surface itself, its
+    // GetOwner() the face; the tracker lists name it as other geometry)
+    let faces: Vec<FaceId> = b.faces().ids().collect();
+    for f in faces {
+        if let Some(s) = must(bp3::face_surface_identity(&mut ctx, b, f))? {
+            owners.push((s, key_of(EntityRef::Face(f))));
+        }
+    }
     // (arena lengths in the walk's kind order: an imported B-rep's ids are its walk
     // indices, and an op only appends)
     let pre = [
@@ -1200,11 +1233,17 @@ fn run_rust_op(
     ctx.set_user_notify_callback(Some(Box::new(recorder)));
     let mut tracker =
         TrackTopologyChanges::new(Some(BrepId::from_index(0)), 7, true, Some(&mut ctx));
-    // Execute's owner walk: each pre-op curve's GetOwner() is its edge
+    // Execute's owner walk: each pre-op curve's GetOwner() is its edge, each pre-op
+    // surface's its face
     tracker.set_owner_metadata(owners.into_iter().map(|(c, e)| (c.key, Some(e))).collect());
     let r = run_rust_op_in(k, b, second, op, a, Some(&mut ctx));
+    // the shim's StopTracking before put_tracker: 1.0.1 records the completed edit's
+    // dependencies (RecordDependencies) on the tracker's lists
+    let recorded =
+        tracker.stop_tracking_with_brep(Some(&mut ctx), b, &entity_of_key, &|e| key_of(e).key);
     let lists = tracker.lists();
     tracker.finish(Some(&mut ctx));
+    must(recorded)?;
     drop(must(ctx.take_notify_lease())?);
     let mut out = r?;
     let geometry_seen = seen
@@ -1236,11 +1275,12 @@ fn run_rust_op(
     let tracker_at = out.len();
     put_tracker(&mut out, &lists, &mut t);
     if matches!(op, OpIn::DeleteFace { .. }) {
-        // the shim's trailer: the edges destroyed (`~SmEdge`'s SM_NO_DESTRUCTION)
+        // the shim's trailer: the edges, edge uses, faces and shells destroyed (their
+        // destructors' SM_NO_DESTRUCTION)
         let destroyed = *edges_destroyed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        out.push(destroyed as f64);
+        out.extend(destroyed.iter().map(|&n| n as f64));
     }
     if matches!(op, OpIn::Orient { .. }) {
         // the shim's trailer: each pre-op face's SmFace::SwapUV POST_EDIT count, the
@@ -1264,9 +1304,8 @@ fn run_rust_op(
 }
 
 /// An `Orient` output (either side) from its trailer: `out` before the tracker,
-/// `swapped` (each face's `SwapUV` count) and, unless that side swapped a face,
-/// `tracker` (see the module docs). An output without a trailer (a B-rep that did not
-/// build) stays whole in `out`.
+/// `swapped` (each face's `SwapUV` count) and `tracker` (see the module docs). An
+/// output without a trailer (a B-rep that did not build) stays whole in `out`.
 fn split_orient(v: Vec<f64>) -> Output {
     let trailer = match v.as_slice() {
         [.., n, at] if *n >= 0.0 && *at >= 0.0 => Some((*n as usize, *at as usize)),
@@ -1283,12 +1322,76 @@ fn split_orient(v: Vec<f64>) -> Output {
     v.truncate(body);
     let swapped = v.split_off(swaps_at);
     let tracker = v.split_off(at);
-    let o = Output::new().values("out", v);
-    if swapped.iter().all(|&x| x == 0.0) {
-        o.values("swapped", swapped).values("tracker", tracker)
-    } else {
-        o.values("swapped", swapped)
+    Output::new()
+        .values("out", v)
+        .values("swapped", swapped)
+        .values("tracker", tracker)
+}
+
+/// The shim's `tag_brep`: every face (`GetFaces` order) and edge (`GetEdges` order)
+/// gets its own long attribute, id = value = `10007 + 500 kind + index`.
+fn tag_brep(b: &mut Brep, behavior: Behavior) -> Result<(), Fail> {
+    let faces = must(bp1::faces(b, None))?;
+    let edges = must(bp1::edges(b, None))?;
+    let tagged = faces
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| (EntityRef::Face(f), 0u64, i))
+        .chain(
+            edges
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| (EntityRef::Edge(e), 1, i)),
+        );
+    for (entity, kind, index) in tagged {
+        let id = 10007 + 500 * kind + index as u64;
+        let value = i64::try_from(id).map_err(|_| Fail::Harness(harness("attribute id")))?;
+        must(b.add_attribute(entity, Attribute::long(id, value, behavior)))?;
     }
+    Ok(())
+}
+
+/// The shim's `put_attribute_rows`: the sorted face rows then edge rows of `b`, each
+/// `n` and per attribute (ascending) `id behavior value users`.
+fn put_attribute_rows(o: &mut Vec<f64>, b: &Brep) -> Result<(), Fail> {
+    let row = |e: EntityRef| {
+        let mut entries: Vec<[f64; 4]> = b
+            .entity_attributes(e)
+            .into_iter()
+            .map(|(_, a)| {
+                [
+                    a.attribute_id() as f64,
+                    f64::from(a.behavior() as u8),
+                    a.long_value().map_or(0.0, |v| v as f64),
+                    a.users().len() as f64,
+                ]
+            })
+            .collect();
+        entries.sort_by(|x, y| cmp_f64s(x, y));
+        let mut r = vec![entries.len() as f64];
+        r.extend(entries.into_iter().flatten());
+        r
+    };
+    let faces = must(bp1::faces(b, None))?;
+    let edges = must(bp1::edges(b, None))?;
+    for mut rows in [
+        faces.into_iter().map(|f| row(EntityRef::Face(f))).collect::<Vec<_>>(),
+        edges.into_iter().map(|e| row(EntityRef::Edge(e))).collect(),
+    ] {
+        rows.sort_by(|x, y| cmp_f64s(x, y));
+        o.push(rows.len() as f64);
+        o.extend(rows.into_iter().flatten());
+    }
+    Ok(())
+}
+
+/// `std::vector<double>`'s lexicographic `<` (finite values).
+fn cmp_f64s(x: &[f64], y: &[f64]) -> core::cmp::Ordering {
+    x.iter()
+        .zip(y)
+        .map(|(p, q)| p.total_cmp(q))
+        .find(|o| o.is_ne())
+        .unwrap_or_else(|| x.len().cmp(&y.len()))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1307,7 +1410,7 @@ fn run_rust_op_in(
             .ok_or_else(|| Fail::Harness(harness("args too short")))
     };
     // (the edits seed every object's SmTopology record the caller keeps none for)
-    let mut records = BTreeMap::new();
+    let mut records = solidcore::topology::topology::NotifyRecords::new();
     let mut attrs = AttributeStore::default();
     let mut env = NotifyEnv {
         records: &mut records,
@@ -1352,6 +1455,50 @@ fn run_rust_op_in(
             out.push(flag(c.editing_enabled()));
             put_counts(&mut out, &c)?;
         }
+        OpIn::AttributedCopy {
+            behavior,
+            shared_naming,
+        } => {
+            let behavior = Behavior::from_code(i32::from(*behavior))
+                .map_err(|e| Fail::Harness(harness(format!("behavior: {e}"))))?;
+            tag_brep(b, behavior)?;
+            let src: &Brep = b;
+            let source: &dyn Fn(EntityRef) -> ObjectRef = if *shared_naming {
+                &key_of
+            } else {
+                &source_key_of
+            };
+            let c = must(bp3::api_brep_copy(k, &mut env, Some(src), source))?;
+            out.push(0.0);
+            out.push(c.tolerance());
+            out.push(flag(c.editing_enabled()));
+            put_counts(&mut out, &c)?;
+            put_attribute_rows(&mut out, &c)?;
+            put_attribute_rows(&mut out, src)?;
+        }
+        OpIn::AttributedMerge {
+            analytics,
+            behavior,
+        } => {
+            let dst = second.ok_or_else(|| Fail::Harness(harness("no second B-rep")))?;
+            let behavior = Behavior::from_code(i32::from(*behavior))
+                .map_err(|e| Fail::Harness(harness(format!("behavior: {e}"))))?;
+            tag_brep(b, behavior)?;
+            let (s, _) = status(bp3::merge_brep(
+                k,
+                &mut env,
+                dst,
+                b,
+                &source_key_of,
+                None,
+                None,
+                *analytics,
+            ))?;
+            out.push(s);
+            put_counts(&mut out, dst)?;
+            put_attribute_rows(&mut out, dst)?;
+            put_attribute_rows(&mut out, b)?;
+        }
         OpIn::Merge { analytics } => {
             let dst = second.ok_or_else(|| Fail::Harness(harness("no second B-rep")))?;
             let (s, _) = status(bp3::merge_brep(
@@ -1369,14 +1516,30 @@ fn run_rust_op_in(
         }
         OpIn::CopyVertices { .. } => {
             let dst = second.ok_or_else(|| Fail::Harness(harness("no second B-rep")))?;
+            let source = must(bp1::vertices(b, None))?;
+            let existing = must(bp1::vertices(dst, None))?;
+            let mut geometry = Vec::new();
+            put_vertex_points(&mut geometry, b, &source)?;
+            put_vertex_points(&mut geometry, dst, &existing)?;
             let n = arg(0)? as usize;
             let vs: Vec<VertexId> = (0..n)
                 .map(|j| arg(1 + j).map(|x| VertexId::from_index(x as u32)))
                 .collect::<Result<_, _>>()?;
             let (s, r) = status(bp3::copy_vertices(k, b, &vs, dst, &mut env, &source_key_of))?;
             out.push(s);
-            out.push(r.map_or(0.0, |x| x.len() as f64));
+            out.push(r.as_ref().map_or(0.0, |x| x.len() as f64));
             put_counts(&mut out, dst)?;
+            put_vertex_points(&mut geometry, b, &source)?;
+            put_vertex_points(&mut geometry, dst, &existing)?;
+            let copied = r.unwrap_or_default();
+            let post = walk(dst)?;
+            geometry.push(copied.len() as f64);
+            for v in copied {
+                geometry.push(post.find(9, Some(v.index())));
+                let p = must(solidcore::topology::vertex::point(dst, v))?;
+                geometry.extend([p.x, p.y, p.z]);
+            }
+            out.extend(geometry);
         }
         OpIn::DeleteFace { .. } => {
             let f = FaceId::from_index(arg(0)? as u32);
@@ -1495,7 +1658,9 @@ fn run_rust_op_in(
                 let s = must(b.face(f))?.surface.as_ref();
                 out.push(s.map_or(-1.0, |x| x.type_code() as f64));
                 if let (Some(_), Some(s)) = (offset, s) {
-                    let d = s.natural_uv_domain();
+                    let d = s
+                        .natural_uv_domain_with_nurb(k)
+                        .map_err(|e| HarnessError::new(e.to_string()))?;
                     out.extend([d.min().x, d.min().y, d.max().x, d.max().y]);
                 }
             }
@@ -1505,12 +1670,23 @@ fn run_rust_op_in(
     Ok(out)
 }
 
+fn put_vertex_points(o: &mut Vec<f64>, b: &Brep, vertices: &[VertexId]) -> Result<(), Fail> {
+    o.push(vertices.len() as f64);
+    for &v in vertices {
+        let p = must(solidcore::topology::vertex::point(b, v))?;
+        o.extend([p.x, p.y, p.z]);
+    }
+    Ok(())
+}
+
 fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
     let mut k = Kernel::default();
     if standalone(&i.op) {
-        let Some((_, args)) = op_args(&i.op, &[0; 10])? else {
+        let Some((op, args)) = op_args(&i.op, &[0; 10])? else {
             return Ok(Output::err("no target"));
         };
+        // an input the FFI refuses is a harness error on both sides
+        ffi::validate(op, "", &args, &[0; 10], false).map_err(|e| ffi_err(&e))?;
         let mut b = Brep::new();
         return match run_rust_op(&mut k, &mut b, None, &i.op, &args) {
             Ok(out) => Ok(Output::new().values("out", out)),
@@ -1518,16 +1694,34 @@ fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
             Err(Fail::Harness(e)) => Err(e),
         };
     }
-    let (path, h, c) = match prepare(i)? {
+    let (mut b, c) = match own_brep(&mut k, i)? {
         Ok(x) => x,
         Err(o) => return Ok(o),
     };
-    let Some((_, args)) = op_args(&i.op, &c)? else {
+    let Some((op, args)) = op_args(&i.op, &c)? else {
         return Ok(Output::err("no target"));
     };
-    let mut b = rust_brep(&path, &h, &c)?;
+    // an input the FFI refuses is a harness error on both sides: the Rust port works
+    // through the guarded hang regimes as upstream does (HANG-16: a `TurnNurbsOffset` of
+    // 1e300 kept it busy for 25 s in the UV trim curve rebuild, nightly fuzz00282), so it
+    // must not run them (fuzz mutations reach them with the C++ side refused). The
+    // checks see the same input vector as the C++ side and this B-rep's own counts.
+    let mut input = head(i)?;
+    input.extend(&args);
+    ffi::validate(
+        op,
+        &path_of(&i.brep)?,
+        &input,
+        &c,
+        b.infinite_region().is_some(),
+    )
+    .map_err(|e| ffi_err(&e))?;
     let mut second = match i.op {
-        OpIn::Merge { .. } | OpIn::CopyVertices { .. } => Some(rust_brep(&path, &h, &c)?),
+        OpIn::Merge { .. } | OpIn::AttributedMerge { .. } | OpIn::CopyVertices { .. } => {
+            Some(own_brep(&mut k, i)?.map_err(
+                |_| harness("the second build of the B-rep failed where the first did not"),
+            )?.0)
+        }
         _ => None,
     };
     match run_rust_op(&mut k, &mut b, second.as_mut(), &i.op, &args) {
@@ -1693,6 +1887,33 @@ impl UnitDiff for Runner {
 mod tests {
     use super::*;
 
+    #[test]
+    fn copy_vertices_observes_returned_geometry_and_order() {
+        let i: Inputs = serde_json::from_value(serde_json::json!({
+            "brep": { "kind": "wire", "curve": { "dim": 3, "p": 1,
+                "cpts": [[2, -3, 5, 1], [7, 11, -13, 1]], "u": [0, 0, 1, 1] },
+                "t0": 0, "t1": 1 },
+            "editing": -1, "op": "copy_vertices", "vertices": [1, 0, 1]
+        }))
+        .unwrap();
+        let cpp = run_cpp(&i).unwrap();
+        let mut rust = run_rust(&i).unwrap();
+        assert!(crate::compare::compare(&cpp, &rust, &[]).pass());
+        let out = rust.values.get_mut("out").unwrap();
+        let tail = &out[out.len() - 13..];
+        assert_eq!(tail[0], 3.0);
+        assert_eq!(&tail[2..5], &[7.0, 11.0, -13.0]);
+        assert_eq!(&tail[6..9], &[2.0, -3.0, 5.0]);
+        assert_eq!(&tail[10..13], &[7.0, 11.0, -13.0]);
+        assert_ne!(
+            tail[1], tail[9],
+            "repeated input must yield distinct copies"
+        );
+        // A wrong copied coordinate must fail independently of counts and graph.
+        *out.last_mut().unwrap() += 1.0;
+        assert!(!crate::compare::compare(&cpp, &rust, &[]).pass());
+    }
+
     /// Classifies the passing cases of the committed report by op and C++ status
     /// (`out[0]` the build status, `out[1]` the op's), the split the PR and the
     /// plan notes quote. Run from the repository with the C++ reference:
@@ -1855,6 +2076,26 @@ mod tests {
         };
         let err = run_cpp(&case(1e300)).unwrap_err().to_string();
         assert!(err.contains("HANG-16"), "{err}");
+        // the Rust side applies the same guard (`ffi::validate`): the port works through
+        // the regime for tens of seconds (nightly fuzz00282, a 1e300 TurnNurbsOffset)
+        let err = run_rust(&case(1e300)).unwrap_err().to_string();
+        assert!(err.contains("HANG-16"), "{err}");
         assert!(run_cpp(&case(0.5)).is_ok());
+    }
+
+    /// Nightly fuzz case `topology.brep_p3/fuzz00282` (`nurbs_off_box_with_large_fillet_-0.05`
+    /// with `/offset = 1e+300`): the FFI refuses the C++ side (HANG-16) and the Rust side
+    /// must be refused the same way instead of running the operation (it took 25 s).
+    #[test]
+    fn huge_offset_is_refused_on_both_sides() {
+        let v = serde_json::json!({
+            "brep": {"kind": "file", "file": "box_with_large_fillet.smb", "rebuild": false},
+            "editing": -1, "op": "turn_nurbs_offset", "offset": 1e300
+        });
+        let i: Inputs = serde_json::from_value(v).unwrap();
+        let cpp = run_cpp(&i).unwrap_err().to_string();
+        let rust = run_rust(&i).unwrap_err().to_string();
+        assert!(cpp.contains("HANG-16"), "{cpp}");
+        assert_eq!(cpp, rust);
     }
 }

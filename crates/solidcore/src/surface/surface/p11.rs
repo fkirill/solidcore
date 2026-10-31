@@ -101,7 +101,7 @@ use super::p1::{
     SspIntersectEnfo, SurfaceSolveContext,
 };
 use super::p2::{cs_are_perpen_disjoint_in, intersect_and_split, original_surface, set_up_breaks};
-use super::p5::{cs_identical_solutions, DropPointOptions};
+use super::p5::{cs_identical_solutions_in, DropPointOptions};
 use super::p6::{boundary_iso_curve, sc_local_solve, ScLocalSolveNodes};
 use super::p7::{pass_ss_convergence_test, SsGlobalSolver};
 use super::{Surface, SurfaceKind};
@@ -500,6 +500,7 @@ impl Surface {
         );
         let (ls_found, ls_x, termination) = {
             let mut ls = LocalSolveNd::new(&mut eval_fun, Some(&ivls), Some(&periodicities));
+            ls.set_skips_failed_evaluations(k.fixes.oscillating_skips_failed_guesses);
             ls.set_desired_accuracy(EFF_ZERO_SQ);
             ls.set_boundary_handler(BoundaryHandler::TotalBoundaryHits, 3);
             ls.set_maximum_iterations(20);
@@ -747,6 +748,7 @@ impl Surface {
                     let r2 = {
                         let mut ls2 =
                             LocalSolveNd::new(&mut eval_fun2, Some(&ivls2), Some(&periodicities2));
+                        ls2.set_skips_failed_evaluations(k.fixes.oscillating_skips_failed_guesses);
                         ls2.set_boundary_handler(BoundaryHandler::TotalBoundaryHits, 8);
 
                         // solve it (SER: checked)
@@ -1196,7 +1198,18 @@ impl<'t, O: SolutionObject + 't> GlobalSolve<'t, O> for CsGlobalSolver<'t, '_, O
         sol2: &Solution<O>,
     ) -> Result<(SolutionPairType, Option<PreferredSolution>)> {
         // (surface::surface::p5)
-        cs_identical_solutions(self.kernel, &self.base, self.surface, sol1, sol2)
+        // the solutions name the solve's curve and surface (`&crCurve`, `this`)
+        if let Some(operands) = &self.operands {
+            cs_identical_solutions_in(self.kernel, &self.base, self.surface, sol1, sol2, operands)
+        } else {
+            let domains = super::p1::SolveOperands {
+                operands: [
+                    super::p5::curve_operand(&self.base, 0, self.curve),
+                    super::p5::surface_operand(&self.base, 1, self.surface_cache, self.surface),
+                ],
+            };
+            cs_identical_solutions_in(self.kernel, &self.base, self.surface, sol1, sol2, &domains)
+        }
     }
 }
 
@@ -1296,7 +1309,7 @@ impl<'t, O: SolutionObject + 't> SsGlobalSolver<'t, '_, O> {
                     ),
                 };
                 // SmIsoCurve(*pSrfEval, dir, value, bFlag) over the evaluated surface
-                let ic = boundary_iso_curve(own_view.eval, dir, value, from_left)?;
+                let ic = boundary_iso_curve(k, own_view.eval, dir, value, from_left)?;
                 // (IsDegenerate's default tolerance SM_EFF_ZERO; the iso curve's kind)
                 if ic.is_degenerate(k, EFF_ZERO, None)? {
                     continue;
@@ -1470,9 +1483,9 @@ impl<'t, O: SolutionObject + 't> SsGlobalSolver<'t, '_, O> {
                 // natural domains, with boundary testing)
                 let found = view1.eval.local_surface_intersect(
                     k,
-                    &view1.eval.natural_uv_domain(),
+                    &view1.eval.natural_uv_domain_with_nurb(k)?,
                     view2.eval,
-                    &view2.eval.natural_uv_domain(),
+                    &view2.eval.natural_uv_domain_with_nurb(k)?,
                     tol,
                     uv_guess1,
                     uv_guess2,
@@ -2001,7 +2014,7 @@ impl Surface {
                 let lift_handle = BoundaryCurveHandle(0, uv_curve.natural_interval());
 
                 // for every U knot (SER: checked)
-                let (knots, _) = self.knots(SurfParamType::U, None)?;
+                let (knots, _) = self.knots_with_nurb(k, SurfParamType::U, None)?;
                 let u_conts = cache.u_continuities();
                 let size = u_conts.len().saturating_sub(1);
                 for iu in 1..size {
@@ -2024,7 +2037,7 @@ impl Surface {
                 }
 
                 // for every V knot (SER: checked)
-                let (knots, _) = self.knots(SurfParamType::V, None)?;
+                let (knots, _) = self.knots_with_nurb(k, SurfParamType::V, None)?;
                 let v_conts = cache.v_continuities();
                 let size = v_conts.len().saturating_sub(1);
                 for iv in 1..size {

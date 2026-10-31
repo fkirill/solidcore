@@ -10,8 +10,13 @@
 //! original edge uses to (the pairs are given; `MapEdgeuses` is unit
 //! `offset.offset_executive_p1`). The script first shapes the fixture (curves and
 //! surfaces of a store, an edge's curve replaced by a store curve, an edge use's UV
-//! trim curve, marked edge uses), then runs the unit's functions. The Rust side imports
-//! the shim's exports of both B-reps (as the `topology.vertexuse` runner does) into two
+//! trim curve, marked edge uses), then runs the unit's functions. The Rust side makes
+//! every B-rep itself from the same source, renumbered into the shim's walk order: an
+//! `.smb` file read by the Rust reader (`crate::own_builder::read_with`), a wire, face
+//! or network built by the Rust kernel (`crate::own_builder::build_as`) and a cylinder
+//! or torus face from the concrete Rust surface (`native_face`); nothing of the shim's
+//! export reaches the Rust side. Only the C++ side's selector resolution imports the
+//! shim's exports. Its two B-reps go into two
 //! [`Brep`]s behind one adapter ([`Two`], which implements the port's [`OffsetBrep`]
 //! with the ported topology functions) and the ported executive
 //! (`offset.offset_executive_p1`, behind the port's [`OffsetExecutive`]) holding the same
@@ -24,7 +29,7 @@
 //! samples, B-rep edits as edge state blocks).
 //!
 //! **Selectors.** Generated handles are selectors taken modulo the entity count of
-//! their kind (both sides resolve them the same way from the exports); store-curve
+//! their kind (each side resolves them the same way from its own B-reps); store-curve
 //! selectors are taken modulo the store curves of the dimension the op needs (null
 //! when there is none). A `from` curve is computed at resolution from the imported
 //! B-rep (the B-spline part of an edge's curve or an edge use's UV trim curve, scaled
@@ -44,18 +49,24 @@
 //! compared output changes at zero), so only a negative tolerance is refused, and the
 //! runner mirrors that refusal (`approx_negative`) as it does the B-rep guards.
 //!
-//! **Hang guards (`-6`, the script stops; the case defers).** The shim does not run two
-//! ops the Rust side defers at anyway, as they can take minutes or not return (the
+//! **Hang guards (rejected).** Two ops can take minutes or not return upstream (the
 //! fuzz allows 20 s a side): a non-local `FaceuseOffset` of an exactly
-//! `SmSurfOfRevolution` surface with self-intersection enabled (`upstream:HANG-26`),
-//! or an unsupported concrete surface kind (`harness:analytic-geometry-export`), and an `EdgeuseOffset` with
-//! `|offset distance| > 1e6` (deferred under `upstream:HANG-27`, the rail's
-//! `SmCrvOnSurf::ApproximateCurve`). The generator's distances (0.001 to 100) never
-//! reach the distance bound. HANG-26 remains guarded independently of exact imports.
+//! `SmSurfOfRevolution` surface with self-intersection enabled (HANG-26), and an
+//! `EdgeuseOffset` with `|offset distance| > 1e6` (HANG-27, the rail's
+//! `SmCrvOnSurf::ApproximateCurve`). Such inputs are undefined in C++ (AGENTS.md
+//! section 4, step 5.6): the runner's `run_cpp` first follows the Rust script on the
+//! same inputs and, when it stops at such an op, returns `Output::rejected` naming the
+//! issue, so neither side runs and nothing is compared. The decision reads only the
+//! inputs and the Rust side. The shim keeps its own stop at those ops (`-6`, the script
+//! stops) as a safety net, as for a non-local `FaceuseOffset` of an unsupported
+//! concrete surface kind, where the Rust side defers
+//! (`harness:analytic-geometry-export`). The generator's distances (0.001 to 100) never
+//! reach the HANG-27 bound. HANG-26 remains guarded independently of exact imports.
 //!
-//! **Analytic faces.** The shared importer brings an `SmBSplineSurface` subclass in as its
-//! B-spline part; revolution, extrusion, cone, cylinder, sphere and torus face surfaces
-//! are then restored from the shim's binary `WriteToDB` records (`read_face_surfaces`)
+//! **Analytic faces.** The Rust side's own B-reps keep their concrete surfaces. On the
+//! C++ side's resolution, the shared importer brings an `SmBSplineSurface` subclass in
+//! as its B-spline part; revolution, extrusion, cone, cylinder, sphere and torus face
+//! surfaces are then restored from the shim's binary `WriteToDB` records (`read_face_surfaces`)
 //! through the existing polymorphic reader. Native type codes, complete record
 //! consumption, face alignment and existing owner identities are checked. Restored
 //! surfaces synchronize their cached tolerance from the actual owning face. No native
@@ -107,7 +118,7 @@ use solidcore::surface::surface::p2::{
     DropCurveFail, SurfaceKind, TsectCurveType, CONE_TYPE, CYLINDER_TYPE, SPHERE_TYPE,
     SURF_OF_EXTRUSION_TYPE, SURF_OF_REVOLUTION_TYPE, TORUS_TYPE,
 };
-use solidcore::surface::surface::{CacheTreeState, Surface};
+use solidcore::surface::surface::Surface;
 use solidcore::surface::volume::Volume;
 use solidcore::topology::database_io::{DatabaseReader, FileType, InputStream};
 use solidcore::topology::edge as ed;
@@ -125,7 +136,7 @@ use solidcore::topology::{
 use solidcore::{EntityRef, SolidError};
 use solidcore_ffi::units::offset_offset_geometry_creation::{self as ffi, Op};
 
-use super::topology_vertexuse::import_with_types;
+use super::topology_vertexuse::{import_raw_with_types, recalc_gaps};
 use crate::case::{CaseContext, CaseSource};
 use crate::runner::default_cases;
 use crate::{Case, HarnessError, Output, Rng, UnitDiff};
@@ -148,10 +159,11 @@ const NULL_DEREF: f64 = -2.0;
 const ANALYTIC_EXPORT: &str = "harness:analytic-geometry-export";
 /// The native offset self-intersection of an exactly `SmSurfOfRevolution` surface
 /// can take minutes (HANG-26); restoring its concrete kind does not remove this guard.
+/// The hang guard's label (the case is rejected, see [`hang_guard`]).
 const HANG_26: &str = "upstream:HANG-26";
-/// The deferral label of an `EdgeuseOffset` whose offset distance is beyond the
+/// The hang guard's label of an `EdgeuseOffset` whose offset distance is beyond the
 /// shim's HANG-27 bound (`plan/upstream-issues.md`): upstream's rail approximation does
-/// not return in time there, so neither side runs the op.
+/// not return in time there, so neither side runs the op (the case is rejected).
 const HANG_27: &str = "upstream:HANG-27";
 /// The shim's `SURFACE_DB_VERSION`: the database version of concrete surface records.
 const SURFACE_DB_VERSION: u64 = 33;
@@ -643,14 +655,14 @@ fn triple_to_h(t: Hin) -> Option<H> {
 /// The topology records, identities and attribute store the notifications run with
 /// (the `topology.vertex` / `topology.edge` runners' environment).
 struct NotifyEnv {
-    records: BTreeMap<ObjectKey, Topology>,
+    records: solidcore::topology::topology::NotifyRecords,
     attributes: AttributeStore,
     this: ObjectRef,
 }
 
 impl NotifyEnv {
     fn new(b: Option<&Brep>) -> Self {
-        let mut records = BTreeMap::new();
+        let mut records = solidcore::topology::topology::NotifyRecords::new();
         records.insert(ObjectKey(1), Topology::new());
         if let Some(b) = b {
             for id in b.vertexuses().ids() {
@@ -1117,12 +1129,8 @@ impl OffsetBrep<H> for Two {
         surface: &Surface,
         handle: Option<H>,
     ) -> solidcore::Result<solidcore::surface::surface_cache::SurfaceCache<H>> {
-        use solidcore::query::face::p2::BrepCacheFace;
-        use solidcore::surface::surface::p1::{
-            get_surface_cache, make_surface_cache, make_trim_srf_cache_with_face,
-        };
-        use solidcore::surface::surface_cache::face_context::MappedCacheFace;
-        use solidcore::surface::trim_srf_cache::CacheFace;
+        use solidcore::query::face::p2::solve_surface_cache_of_face;
+        use solidcore::surface::surface::p1::{get_surface_cache, make_surface_cache};
         // the solve's GetTree: a reused cache whose tree is not built builds it now
         let with_tree = |mut cache: solidcore::surface::surface_cache::SurfaceCache<H>| {
             if cache.tree().is_none() {
@@ -1159,42 +1167,12 @@ impl OffsetBrep<H> for Two {
         if actual_owner != Some(owner) {
             return Err(invalid("surface owner is not the selected B-rep face"));
         }
+        // the surface's trimmed cache, kept with it as upstream keeps it (reused by
+        // later solves on the same surface)
         let map = |entity| Ok(cache_topology_handle(h.b, entity));
-        let unmap = |handle: H| {
-            if handle.b != h.b {
-                return Err(invalid("cache handle belongs to a different B-rep"));
-            }
-            Ok(match handle.kind {
-                K_FACE => EntityRef::Face(FaceId::from_index(handle.i)),
-                K_EDGE => EntityRef::Edge(EdgeId::from_index(handle.i)),
-                K_VERTEX => EntityRef::Vertex(VertexId::from_index(handle.i)),
-                K_EDGEUSE => EntityRef::Edgeuse(EdgeuseId::from_index(handle.i)),
-                K_VERTEXUSE => EntityRef::Vertexuse(VertexuseId::from_index(handle.i)),
-                K_LOOPUSE => {
-                    EntityRef::Loopuse(solidcore::topology::LoopuseId::from_index(handle.i))
-                }
-                _ => return Err(invalid("unsupported typed cache handle")),
-            })
-        };
-        let mut context = MappedCacheFace::new(BrepCacheFace { b, f: face }, &map, &unmap)?;
-        match make_trim_srf_cache_with_face(k, surface, handle, &mut context) {
-            Ok(mut cache) => {
-                cache.bind_face(
-                    owner,
-                    cache_topology_handle(h.b, EntityRef::Face(face)),
-                    context.zone_tol_3d(k, context.face())?,
-                )?;
-                if cache.base().tree().is_none() {
-                    cache.build_tree_with_face(k, &mut context)?;
-                }
-                Ok(cache.into_base())
-            }
-            Err(
-                e @ (SolidError::Unported { .. }
-                | SolidError::InvalidInput { .. }
-                | SolidError::NotFound { .. }),
-            ) => Err(e),
-            Err(_) => make_surface_cache(k, surface, handle),
+        match solve_surface_cache_of_face(k, b, face, owner, surface, handle, map)? {
+            Some(cache) => Ok(cache),
+            None => make_surface_cache(k, surface, handle),
         }
     }
 
@@ -1657,7 +1635,7 @@ impl OffsetExecutive<H> for Exec {
             self.inner.insert_extended_surface(key, surface.clone());
         }
         let ext = self.inner.get_create_extended_surface(k, key, &surface)?;
-        let domain = ext.natural_uv_domain();
+        let domain = ext.natural_uv_domain_with_nurb(k)?;
         if seeded {
             // the seeded entry is the base itself, as `m_vSurfExtSurf.Insert(s, s)`
             return Ok((base, domain));
@@ -1764,7 +1742,8 @@ fn put_srf(k: &Kernel, o: &mut Vec<f64>, s: Option<&Surface>) {
         return;
     };
     o.push(s.type_code() as f64);
-    let d = s.natural_uv_domain();
+    // (runner helper that does not return Result)
+    let d = s.natural_uv_domain_if_built();
     o.extend([d.u_min(), d.u_max(), d.v_min(), d.v_max()]);
     for i in 0..=2 {
         for j in 0..=2 {
@@ -2375,58 +2354,179 @@ fn read_face_surfaces(
     Ok(())
 }
 
-/// Restores the state of every face surface's cache after the C++ build
-/// ([`ffi::split_cache_tree_states`]): reading a file builds the B-rep while doing a
-/// Boolean operation, so face surfaces can keep caches whose trees were never built,
-/// and `GetDomainWithContinuity` / `LiftCurve` read their (empty) continuity arrays.
-fn seed_cache_tree_states(b: &Brep, states: &[u8]) -> Result<(), HarnessError> {
-    if states.len() != b.faces().len() {
-        return Err(harness("cache states do not match the native face list"));
-    }
-    for (i, &s) in states.iter().enumerate() {
-        let f = FaceId::from_index(u32::try_from(i).map_err(|_| harness("face index"))?);
-        let state = match s {
-            0 => CacheTreeState::NoCache,
-            1 => CacheTreeState::Unbuilt,
-            _ => CacheTreeState::Built,
-        };
-        if let Some(surface) = b.face(f).map_err(|e| harness(e.to_string()))?.surface.as_ref() {
-            surface.set_cache_tree_state(state);
-        }
-    }
-    Ok(())
-}
-
 struct Prepared {
     two: Two,
     hdr: RHeader,
     ops: Vec<ROp>,
+    /// The failure of [`recalc_gaps`] on either B-rep, which only the Rust side
+    /// reports.
+    refill: Option<SolidError>,
 }
 
-/// Exports and imports the B-reps and resolves the script; `Err(Ok(output))` is the
-/// output both sides report when the B-reps cannot be built or something cannot be
-/// resolved.
-fn prepare(i: &Inputs) -> Result<Prepared, Box<Result<Output, HarnessError>>> {
-    let ex = export(i).map_err(|e| Box::new(Err(e)))?;
-    let Some((a, b)) = ffi::split_exports(&ex) else {
-        return Err(Box::new(Ok(build_failure(&ex))));
+/// What ends [`prepare`] early: the output the side reports, or a harness error.
+type Early = Box<Result<Output, HarnessError>>;
+
+/// One B-rep of the case: on the Rust side the B-rep the Rust kernel makes from the
+/// source itself ([`side`], renumbered into the shim's walk order), on the C++ side the
+/// import of the shim's export.
+enum Side {
+    /// Made by the Rust side itself: the B-rep, or the Rust build's failure.
+    Own(Result<Box<Brep>, SolidError>),
+    /// Imported from the shim's export.
+    Import,
+}
+
+/// [`Side::Own`] when `own` (the Rust side), else [`Side::Import`]. An `.smb` file is
+/// read by the Rust reader ([`crate::own_builder::read_with`]), a wire, face or network
+/// built by [`crate::own_builder::build_as`] (the shim's `build`, `m_bValidateOnly`
+/// and the gap walk off, as [`brep_block`] encodes them) and a cylinder or torus face
+/// by [`native_face`], all under [`Conventions::EDGEUSE_GRAPH`].
+///
+/// [`Conventions::EDGEUSE_GRAPH`]: crate::own_builder::Conventions::EDGEUSE_GRAPH
+fn side(k: &mut Kernel, b: &BrepIn, own: bool) -> Result<Side, HarnessError> {
+    use crate::own_builder::{build_as, finish, read_with, Built, Conventions};
+    if !own {
+        return Ok(Side::Import);
+    }
+    let conv = &Conventions::EDGEUSE_GRAPH;
+    let built = match b {
+        BrepIn::File { rebuild, .. } => {
+            let path = path_of(Some(b))?;
+            read_with(k, &path, *rebuild, false, false, conv)?
+        }
+        BrepIn::Cylinder { .. } | BrepIn::Torus { .. } => {
+            let raw = native_face(k, b)?;
+            finish(k, raw, false, false, conv)?
+        }
+        BrepIn::Wire { .. } | BrepIn::Face { .. } | BrepIn::Network => {
+            build_as(k, b, false, false, conv)?
+                .ok_or_else(|| harness("own builder: a non-file source was not built"))?
+        }
     };
-    let [surfaces_a, surfaces_b] =
-        ffi::split_surface_records(&ex).ok_or_else(|| Box::new(Err(harness("surface records"))))?;
-    let (mut brep_a, mut exact_a, types_a) = import_with_types(&a).map_err(|e| Box::new(Err(e)))?;
-    read_face_surfaces(&mut brep_a, &mut exact_a, &types_a, &surfaces_a)
-        .map_err(|e| Box::new(Err(e)))?;
-    let [states_a, states_b] = ffi::split_cache_tree_states(&ex)
-        .ok_or_else(|| Box::new(Err(harness("cache states"))))?;
-    seed_cache_tree_states(&brep_a, &states_a).map_err(|e| Box::new(Err(e)))?;
-    let (brep_b, exact_b) = match &b {
-        Some(b) => {
-            let (mut brep, mut exact, types) =
-                import_with_types(b).map_err(|e| Box::new(Err(e)))?;
-            read_face_surfaces(&mut brep, &mut exact, &types, &surfaces_b)
-                .map_err(|e| Box::new(Err(e)))?;
-            seed_cache_tree_states(&brep, &states_b).map_err(|e| Box::new(Err(e)))?;
-            (Some(brep), exact)
+    Ok(Side::Own(match built {
+        Built::Brep(b) => Ok(b),
+        Built::Failed(e) => Err(e),
+    }))
+}
+
+/// The shim's block 6 (`build_input`): a concrete `SmCylinder` (radius, height; 0 to
+/// 360 degrees) or `SmTorus` (major, minor radius; `SmExtent2d(0, 0, 360, 360)`) at the
+/// origin with axes x and y, no swap, not inside out, `MakeNurb`, then
+/// `CreateFaceFromSurface(surface, GetNaturalUVDomain())` on a new B-rep.
+fn native_face(k: &mut Kernel, b: &BrepIn) -> Result<Result<Brep, SolidError>, HarnessError> {
+    use crate::own_builder::{create_face, in_new_brep};
+    use solidcore::surface::cone::Cone;
+    use solidcore::surface::torus::{Torus, TorusOptions};
+    let origin = Point3::new(0.0, 0.0, 0.0);
+    let (x, y) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0));
+    let made = match *b {
+        BrepIn::Cylinder { radius, height } => {
+            let mut c = Cone::new_cylinder_bounded(
+                origin, x, y, radius, 0.0, 360.0, height, false, false, false,
+            );
+            c.make_nurb(k).map(|()| Surface::from(c))
+        }
+        BrepIn::Torus { major, minor } => {
+            let opts = TorusOptions {
+                swap_uv: false,
+                inside_out: false,
+                circle_nurb: None,
+            };
+            let d = Extent2d::from_bounds(0.0, 0.0, 360.0, 360.0);
+            Torus::new(k, origin, x, y, d, major, minor, opts)
+                .and_then(|mut t| t.make_nurb(k).map(|()| Surface::from(t)))
+        }
+        _ => return Err(harness("native face of a source other than block 6")),
+    };
+    let surface = match made {
+        Ok(s) => s,
+        Err(e) => return Ok(Err(e)),
+    };
+    let d = match surface.natural_uv_domain_with_nurb(k) {
+        Ok(d) => d,
+        Err(e) => return Ok(Err(e)),
+    };
+    let dom = [d.u_min(), d.v_min(), d.u_max(), d.v_max()];
+    in_new_brep(k, |k, b| create_face(k, b, surface, dom).map(|_| ()))
+}
+
+/// A failed Rust build of B-rep `which` (`a` / `b`) as the shim reports a failed build.
+fn own_failure(which: &str, e: &SolidError) -> Output {
+    Output::unported(e).unwrap_or_else(|| {
+        Output::err(format!(
+            "brep_build_{which}_status_{}",
+            crate::own_builder::build_status(e)
+        ))
+    })
+}
+
+/// Builds the B-reps and resolves the script; `Err(Ok(output))` is the output the side
+/// reports when the B-reps cannot be built or something cannot be resolved. With `own`
+/// (the Rust side) every source is made by the Rust kernel ([`side`]), so no C++ export
+/// reaches the Rust side; the C++ side imports the shim's export.
+fn prepare(i: &Inputs, own: bool) -> Result<Prepared, Box<Result<Output, HarnessError>>> {
+    let mut k = Kernel::default();
+    let side_a = side(&mut k, &i.brep_a, own).map_err(|e| Box::new(Err(e)))?;
+    let side_b = match &i.brep_b {
+        Some(b) => Some(side(&mut k, b, own).map_err(|e| Box::new(Err(e)))?),
+        None => None,
+    };
+    // the shim builds A, then B
+    if let Side::Own(Err(e)) = &side_a {
+        return Err(Box::new(Ok(own_failure("a", e))));
+    }
+    if let Some(Side::Own(Err(e))) = &side_b {
+        return Err(Box::new(Ok(own_failure("b", e))));
+    }
+    let needs_export = matches!(side_a, Side::Import) || matches!(side_b, Some(Side::Import));
+    let (ex_a, ex_b, surfaces) = if needs_export {
+        let ex = export(i).map_err(|e| Box::new(Err(e)))?;
+        let Some((a, b)) = ffi::split_exports(&ex) else {
+            return Err(Box::new(Ok(build_failure(&ex))));
+        };
+        let surfaces = ffi::split_surface_records(&ex)
+            .ok_or_else(|| Box::new(Err(harness("surface records"))))?;
+        (Some(a), b, Some(surfaces))
+    } else {
+        (None, None, None)
+    };
+    let [surfaces_a, surfaces_b] = surfaces.unwrap_or_default();
+    // An imported B-rep: the export says which gaps are cached, not their values (the
+    // raw import leaves them at SM_UNDEF_DOUBLE): recompute them on the restored face
+    // surfaces, as the refilling importers do. This runs on both sides; only the Rust
+    // side reports a failure. No C++ cache state is copied onto the Rust B-reps: the
+    // face surfaces keep the cache state the Rust side's own construction leaves.
+    let mut refill = None;
+    let mut import = |ex: Option<&Vec<f64>>,
+                      records: &[Option<Vec<u8>>]|
+     -> Result<(Brep, Vec<bool>), Early> {
+        let ex = ex.ok_or_else(|| Box::new(Err(harness("export of an imported B-rep"))))?;
+        let (mut brep, mut exact, types) =
+            import_raw_with_types(ex).map_err(|e| Box::new(Err(e)))?;
+        read_face_surfaces(&mut brep, &mut exact, &types, records)
+            .map_err(|e| Box::new(Err(e)))?;
+        if refill.is_none() {
+            refill = recalc_gaps(&mut brep).err();
+        }
+        Ok((brep, exact))
+    };
+    // a B-rep the Rust side made itself has its own geometry: every face is exact
+    let own_exact = |b: &Brep| vec![true; b.faces().len()];
+    let (brep_a, exact_a) = match side_a {
+        Side::Own(Ok(b)) => {
+            let e = own_exact(&b);
+            (*b, e)
+        }
+        Side::Own(Err(_)) | Side::Import => import(ex_a.as_ref(), &surfaces_a)?,
+    };
+    let (brep_b, exact_b) = match side_b {
+        Some(Side::Own(Ok(b))) => {
+            let e = own_exact(&b);
+            (Some(*b), e)
+        }
+        Some(Side::Own(Err(_)) | Side::Import) => {
+            let (b, e) = import(ex_b.as_ref(), &surfaces_b)?;
+            (Some(b), e)
         }
         None => (None, Vec::new()),
     };
@@ -2449,11 +2549,19 @@ fn prepare(i: &Inputs) -> Result<Prepared, Box<Result<Output, HarnessError>>> {
         Ok(r) => r,
         Err(name) => return Err(Box::new(Ok(Output::err(name)))),
     };
-    Ok(Prepared { two, hdr, ops })
+    Ok(Prepared {
+        two,
+        hdr,
+        ops,
+        refill,
+    })
 }
 
 fn run_cpp(i: &Inputs) -> Result<Output, HarnessError> {
-    let p = match prepare(i) {
+    if let Some(reason) = hang_guard(i) {
+        return Ok(Output::rejected(reason));
+    }
+    let p = match prepare(i, false) {
         Ok(p) => p,
         Err(r) => return *r,
     };
@@ -2467,12 +2575,39 @@ fn run_cpp(i: &Inputs) -> Result<Output, HarnessError> {
     Ok(Output::new().values("state", out))
 }
 
+/// The rejection reason of a script that reaches an op upstream does not return in
+/// time on (`plan/upstream-issues.md` HANG-26, HANG-27; AGENTS.md section 4, step 5.6):
+/// the Rust script on the same inputs stops at that op ([`Fail::Hang`]). Decided from
+/// the inputs and the Rust side only, never from C++ output; the shim's own `-6` stop
+/// at that op stays as a safety net. A script the Rust side cannot follow that far (an
+/// unported callee first) runs in C++ as before, and the Rust side defers it.
+fn hang_guard(i: &Inputs) -> Option<&'static str> {
+    let p = prepare(i, true).ok()?;
+    if p.refill.is_some() {
+        return None;
+    }
+    match run_rust_script(i, p) {
+        Err(Fail::Hang(HANG_26)) => Some(
+            "HANG-26: FaceuseOffset self-intersection of a surface of revolution does not \
+             return in time; not run",
+        ),
+        Err(Fail::Hang(_)) => Some(
+            "HANG-27: EdgeuseOffset beyond the distance bound (SmCrvOnSurf::ApproximateCurve \
+             of the rail) does not return in time; not run",
+        ),
+        _ => None,
+    }
+}
+
 // ---- the script, Rust side --------------------------------------------------------------
 
-/// A failure of the Rust side: an error to report or an unported callee.
+/// A failure of the Rust side: an error to report or an unported callee, or an op
+/// the script stops at because upstream does not return in time there (the label of
+/// the hang guard [`run_cpp`] rejects the case for).
 enum Fail {
     Solid(SolidError),
     Harness(HarnessError),
+    Hang(&'static str),
 }
 
 impl From<SolidError> for Fail {
@@ -2510,7 +2645,7 @@ fn status<T>(r: Result<T, SolidError>, o: &mut Vec<f64>) -> Result<Option<T>, Fa
             o.push(NULL_DEREF);
             Ok(None)
         }
-        Err(SolidError::InvalidInput { .. }) => {
+        Err(SolidError::InvalidInput { .. } | SolidError::PortInvariant { .. }) => {
             // upstream's SM_ERR_INVALID_INPUT status of a callee
             o.push(SM_ERR_INVALID_INPUT);
             Ok(None)
@@ -2655,7 +2790,9 @@ fn is_bspline_kind(c: &SmCurve) -> bool {
 #[allow(clippy::too_many_lines)]
 fn run_rust_script(i: &Inputs, p: Prepared) -> Result<Vec<f64>, Fail> {
     let k = Kernel::default();
-    let Prepared { mut two, hdr, ops } = p;
+    let Prepared {
+        mut two, hdr, ops, ..
+    } = p;
     let mut o = Vec::new();
     o.push(0.0);
 
@@ -2826,10 +2963,7 @@ fn run_rust_script(i: &Inputs, p: Prepared) -> Result<Vec<f64>, Fail> {
                         && ClassGeometry::surface(&two, surface)
                             .is_some_and(|s| s.type_code() == SURF_OF_REVOLUTION_TYPE)
                     {
-                        return Err(Fail::Solid(SolidError::Unported {
-                            upstream: "FaceuseOffset self-intersection of a surface of revolution (HANG-26)",
-                            unit: HANG_26,
-                        }));
+                        return Err(Fail::Hang(HANG_26));
                     }
                 }
                 let r = if is_local {
@@ -3163,10 +3297,7 @@ fn run_rust_script(i: &Inputs, p: Prepared) -> Result<Vec<f64>, Fail> {
                 }
                 if i.dist.abs() > MAX_EDGEUSE_OFFSET_DISTANCE {
                     // the shim stops the script here (HANG-27)
-                    return Err(Fail::Solid(SolidError::Unported {
-                        upstream: "EdgeuseOffset beyond the HANG-27 distance bound (SmCrvOnSurf::ApproximateCurve of the rail)",
-                        unit: HANG_27,
-                    }));
+                    return Err(Fail::Hang(HANG_27));
                 }
                 if exec.extend_convex_edges() {
                     // a tangent or lamina edge goes to ExtendTrimEdges, which dereferences
@@ -3276,10 +3407,16 @@ fn rust_surface(s: &SrfIn) -> Result<Surface, HarnessError> {
 }
 
 fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
-    let p = match prepare(i) {
+    let p = match prepare(i, true) {
         Ok(p) => p,
         Err(r) => return *r,
     };
+    if let Some(e) = &p.refill {
+        return match Output::unported(e) {
+            Some(o) => Ok(o),
+            None => Err(harness(format!("rust: cached gap refill: {e}"))),
+        };
+    }
     match run_rust_script(i, p) {
         Ok(o) => Ok(Output::new().values("state", o)),
         Err(Fail::Solid(e)) => match Output::unported(&e) {
@@ -3287,6 +3424,10 @@ fn run_rust(i: &Inputs) -> Result<Output, HarnessError> {
             None => Err(harness(format!("rust: {e}"))),
         },
         Err(Fail::Harness(h)) => Err(h),
+        // (the C++ side rejects such a script before either side runs it)
+        Err(Fail::Hang(label)) => Err(harness(format!(
+            "rust: the script reaches the {label} hang guard, which the C++ side rejects"
+        ))),
     }
 }
 
@@ -4054,6 +4195,92 @@ fn edge_cases() -> Vec<(String, Value)> {
         add("box_vertex_offset_three_arcs", i);
     }
 
+    // VertexOffset with three arcs where an arc's ends both miss another arc's plane:
+    // the arc is rebuilt through the circle's intersections with the two other planes
+    // (`short`, `both_short`), or the rebuild fails because its circle lies in the third
+    // plane (`coincident`) or misses the plane (`no_intersection`)
+    {
+        // a rational quadratic arc about `c` in the plane of the unit vectors `u`, `v`,
+        // from angle `a0` to `a1` (degrees, less than 180 apart)
+        let plane_arc = |c: [f64; 3], u: [f64; 3], v: [f64; 3], r: f64, a0: f64, a1: f64| {
+            let at = |a: f64, rr: f64| -> [f64; 3] {
+                let (sa, ca) = a.to_radians().sin_cos();
+                [
+                    c[0] + rr * (ca * u[0] + sa * v[0]),
+                    c[1] + rr * (ca * u[1] + sa * v[1]),
+                    c[2] + rr * (ca * u[2] + sa * v[2]),
+                ]
+            };
+            let w = (0.5 * (a1 - a0)).to_radians().cos();
+            let (p0, p2) = (at(a0, r), at(a1, r));
+            let p1 = at(0.5 * (a0 + a1), r / w);
+            CrvIn {
+                dim: 3,
+                cpts: vec![
+                    [p0[0], p0[1], p0[2], 1.0],
+                    [p1[0] * w, p1[1] * w, p1[2] * w, w],
+                    [p2[0], p2[1], p2[2], 1.0],
+                ],
+                p: 2,
+                u: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            }
+        };
+        let (x, y, z) = ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+        let o = [0.0; 3];
+        let r = 0.5;
+        for (name, c0, c1, c2) in [
+            (
+                "short",
+                plane_arc(o, x, y, r, 10.0, 80.0),
+                plane_arc(o, y, z, r, 0.0, 90.0),
+                plane_arc(o, z, x, r, 0.0, 90.0),
+            ),
+            (
+                "both_short",
+                plane_arc(o, x, y, r, 15.0, 70.0),
+                plane_arc(o, y, z, r, 20.0, 85.0),
+                plane_arc(o, z, x, r, 0.0, 90.0),
+            ),
+            (
+                "coincident",
+                plane_arc(o, x, y, r, 10.0, 80.0),
+                plane_arc(o, y, z, r, 0.0, 90.0),
+                plane_arc(o, x, y, r, 100.0, 170.0),
+            ),
+            (
+                "no_intersection",
+                plane_arc(o, x, y, r, 10.0, 80.0),
+                plane_arc([5.0 * r, 0.0, 0.0], y, z, r, 0.0, 90.0),
+                plane_arc(o, z, x, r, 0.0, 90.0),
+            ),
+        ] {
+            let f = "box_with_large_fillet.smb";
+            let mut i = base(f, Some(f), r);
+            i.ops = vec![
+                OpIn::AddCurve { curve: c0 },
+                OpIn::AddCurve { curve: c1 },
+                OpIn::AddCurve { curve: c2 },
+                OpIn::SetEdgeCurve {
+                    e: h(1, K_EDGE, 0),
+                    c: h(2, K_CURVE, 0),
+                },
+                OpIn::SetEdgeCurve {
+                    e: h(1, K_EDGE, 1),
+                    c: h(2, K_CURVE, 1),
+                },
+                OpIn::SetEdgeCurve {
+                    e: h(1, K_EDGE, 2),
+                    c: h(2, K_CURVE, 2),
+                },
+                OpIn::VertexOffset {
+                    v: h(0, K_VERTEX, 0),
+                    edges: vec![h(1, K_EDGE, 0), h(1, K_EDGE, 1), h(1, K_EDGE, 2)],
+                },
+            ];
+            add(&format!("box_vertex_offset_three_arcs_{name}"), i);
+        }
+    }
+
     // EdgeuseOffset on real solids: convex / tangent sectors, nulls, shell faces, inset
     for (name, f, dist) in [
         ("cone", "cone.smb", 0.5),
@@ -4370,6 +4597,56 @@ fn edge_cases() -> Vec<(String, Value)> {
         add("cone_mate_extend_local", i);
     }
 
+    // UpdateFaceSurfaceDomain on the cone face after its three edge uses' UV trim curves
+    // are scaled, moved or shrunk: the face takes the trim curves' domain, limited to
+    // the surface's (`CalculateUVDomainFromUVTrimCurves` defaults `bLimitDomain` to
+    // TRUE, so the extended-surface replacement is unreachable), or SM_ERR when the
+    // curves miss the surface's domain
+    for (name, d, scale, s) in [
+        ("scaled", [0.0, 0.0, 0.0], 1.5, h(0, K_FACE_SURFACE, 0)),
+        ("moved", [0.75, -0.5, 0.0], 1.0, h(0, K_FACE_SURFACE, 0)),
+        ("scaled_store", [0.1, 0.2, 0.0], 1.25, h(2, K_SURFACE, 0)),
+        ("shrunk", [0.0, 0.0, 0.0], 0.5, h(0, K_FACE_SURFACE, 0)),
+        // trim curves wholly outside the surface's domain: SM_ERR
+        ("disjoint", [100.0, 100.0, 0.0], 1.0, h(0, K_FACE_SURFACE, 0)),
+    ] {
+        let mut i = base("cone.smb", None, 0.5);
+        i.ops = vec![OpIn::AddSurface {
+            surface: SrfIn::Bspline(BssIn {
+                oob: false,
+                form: 0,
+                net: vec![
+                    vec![[-5.0, -5.0, 0.0, 1.0], [5.0, -5.0, 0.0, 1.0]],
+                    vec![[-5.0, 5.0, 0.0, 1.0], [5.0, 5.0, 1.0, 1.0]],
+                ],
+                p: 1,
+                q: 1,
+                u: vec![-10.0, -10.0, 10.0, 10.0],
+                v: vec![-10.0, -10.0, 10.0, 10.0],
+            }),
+        }];
+        for j in 0..3 {
+            i.ops.push(OpIn::AddCurveFrom {
+                src: h(0, K_EDGEUSE, j),
+                d,
+                scale,
+            });
+        }
+        for j in 0..3 {
+            i.ops.push(OpIn::SetEuUv {
+                eu: h(0, K_EDGEUSE, j),
+                c: h(2, K_CURVE, j),
+                max_dist: 0.0,
+            });
+        }
+        i.ops.push(OpIn::UpdateFaceDomain {
+            f: h(0, K_FACE, 0),
+            s,
+        });
+        i.ops.push(OpIn::Getters);
+        add(&format!("cone_update_face_domain_{name}"), i);
+    }
+
     // the guard refusals on non-solid B-reps
     for (name, a) in [
         ("network", BrepIn::Network),
@@ -4494,6 +4771,180 @@ fn edge_cases() -> Vec<(String, Value)> {
     }];
     add("cone_have_tangent_gaps_no_samples", i);
 
+    // EdgeuseOffset's torus caps on box_with_large_fillet's convex edge 14 (edge uses 0
+    // and 22): the original edge gets the centre circle, the offset edges of edge uses 0
+    // (edge 14) and 1 (edge 12) the two rails, so the rails start a minor radius from the
+    // centre line's start. A plain torus, the rail swap (rail 2 has the centre line's
+    // radius), a self-intersecting torus whose arc the axis ray trims, one whose ray
+    // misses the arc, and seeded tori (their own rng).
+    {
+        let circle = |r: f64, z: f64| {
+            let w = std::f64::consts::FRAC_1_SQRT_2;
+            CrvIn {
+                dim: 3,
+                cpts: vec![
+                    [r, 0.0, z, 1.0],
+                    [r * w, r * w, z * w, w],
+                    [0.0, r, z, 1.0],
+                    [-r * w, r * w, z * w, w],
+                    [-r, 0.0, z, 1.0],
+                ],
+                p: 2,
+                u: vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0],
+            }
+        };
+        let torus_case = |dist: f64, analytics: bool, c0: CrvIn, c1: CrvIn, c2: CrvIn| {
+            let f = "box_with_large_fillet.smb";
+            let mut i = base(f, Some(f), dist);
+            i.analytics = analytics;
+            i.pairs = pairs(30, 1);
+            i.ops = vec![
+                OpIn::AddCurve { curve: c0 },
+                OpIn::AddCurve { curve: c1 },
+                OpIn::AddCurve { curve: c2 },
+                OpIn::SetEdgeCurve {
+                    e: h(0, K_EDGE, 14),
+                    c: h(2, K_CURVE, 0),
+                },
+                OpIn::SetEdgeCurve {
+                    e: h(1, K_EDGE, 14),
+                    c: h(2, K_CURVE, 1),
+                },
+                OpIn::SetEdgeCurve {
+                    e: h(1, K_EDGE, 12),
+                    c: h(2, K_CURVE, 2),
+                },
+                OpIn::EdgeuseOffset {
+                    orig: h(0, K_EDGEUSE, 0),
+                    other_orig: h(0, K_EDGEUSE, 1),
+                    off: h(1, K_EDGEUSE, 0),
+                    other_off: h(1, K_EDGEUSE, 1),
+                },
+                OpIn::EdgeState {
+                    e: h(1, K_EDGE, 14),
+                },
+                OpIn::EdgeState {
+                    e: h(1, K_EDGE, 12),
+                },
+            ];
+            i
+        };
+        let a260 = 260.0_f64.to_radians();
+        for (name, dist, analytics, c0, c1, c2) in [
+            (
+                "plain",
+                0.5,
+                true,
+                circle(2.0, 0.0),
+                circle(2.5, 0.0),
+                circle(1.5, 0.0),
+            ),
+            (
+                "plain_no_analytics",
+                0.5,
+                false,
+                circle(2.0, 0.0),
+                circle(2.5, 0.0),
+                circle(1.5, 0.0),
+            ),
+            (
+                "swap",
+                0.5,
+                true,
+                circle(2.0, 0.0),
+                circle(2.5, 0.0),
+                circle(2.0, 0.5),
+            ),
+            (
+                "self_intersecting_trim",
+                3.0,
+                true,
+                circle(1.0, 0.0),
+                circle(1.0, 3.0),
+                circle(1.0 + 3.0 * a260.cos(), 3.0 * a260.sin()),
+            ),
+            (
+                "self_intersecting_miss",
+                3.0,
+                true,
+                circle(1.0, 0.0),
+                circle(4.0, 0.0),
+                circle(1.0, 3.0),
+            ),
+            // rails on one circle, and rails 5e-4 apart (within ten edge tolerances):
+            // no cap, the offset edges' tolerances grow to twice the rail distance
+            (
+                "coincident_rails",
+                0.5,
+                true,
+                circle(2.0, 0.0),
+                circle(2.5, 0.0),
+                circle(2.5, 0.0),
+            ),
+            (
+                "rails_within_tolerance",
+                0.5,
+                true,
+                circle(2.0, 0.0),
+                circle(2.5, 0.0),
+                circle(2.5005, 0.0),
+            ),
+        ] {
+            add(
+                &format!("box_edgeuse_offset_torus_cap_{name}"),
+                torus_case(dist, analytics, c0, c1, c2),
+            );
+        }
+        let mut rng = Rng::new(0xFF_5E77_04D5);
+        let mut made = 0;
+        for _ in 0..64 {
+            if made == 8 {
+                break;
+            }
+            let major = rng.uniform(1.0, 4.0);
+            let minor = rng.uniform(0.2, 2.0 * major);
+            let t1 = rng.uniform(-170.0, 170.0).to_radians();
+            let t2 = t1 + rng.uniform(20.0, 170.0).to_radians();
+            let (r1, r2) = (major + minor * t1.cos(), major + minor * t2.cos());
+            if r1 < 0.05 || r2 < 0.05 {
+                continue;
+            }
+            let analytics = rng.chance(0.5);
+            add(
+                &format!("box_edgeuse_offset_torus_cap_seeded{made}"),
+                torus_case(
+                    minor,
+                    analytics,
+                    circle(major, 0.0),
+                    circle(r1, minor * t1.sin()),
+                    circle(r2, minor * t2.sin()),
+                ),
+            );
+            made += 1;
+        }
+    }
+
+    // EdgeuseOffset on box_with_large_fillet's tangent, non-convex edge 3 (edge uses 7
+    // and 29): with offset edge uses on one edge (no gaps: nothing built) and on two
+    // edges (edge 3 and edge 10, gaps: SM_ERR), and without an offset edge use
+    for (name, off, other_off) in [
+        ("same_edge", h(1, K_EDGEUSE, 7), h(1, K_EDGEUSE, 29)),
+        ("gaps", h(1, K_EDGEUSE, 7), h(1, K_EDGEUSE, 16)),
+        ("gaps_reversed", h(1, K_EDGEUSE, 16), h(1, K_EDGEUSE, 7)),
+        ("no_offset", NULL_H, h(1, K_EDGEUSE, 16)),
+    ] {
+        let f = "box_with_large_fillet.smb";
+        let mut i = base(f, Some(f), 0.25);
+        i.pairs = pairs(30, 1);
+        i.ops = vec![OpIn::EdgeuseOffset {
+            orig: h(0, K_EDGEUSE, 7),
+            other_orig: h(0, K_EDGEUSE, 29),
+            off,
+            other_off,
+        }];
+        add(&format!("box_edgeuse_offset_tangent_sector_{name}"), i);
+    }
+
     out
 }
 
@@ -4554,6 +5005,7 @@ fn zero_header_cases(unit: &str, cases: &[Case]) -> Result<Vec<Case>, HarnessErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compare::compare;
 
     fn import_input(name: &str) -> Inputs {
         Inputs {
@@ -4616,7 +5068,7 @@ mod tests {
             let (a, b) = ffi::split_exports(&out).unwrap();
             let records = ffi::split_surface_records(&out).unwrap();
             for (block, records) in [a, b.unwrap()].iter().zip(&records) {
-                let (mut brep, mut exact, types) = import_with_types(block).unwrap();
+                let (mut brep, mut exact, types) = import_raw_with_types(block).unwrap();
                 assert!(types.contains(&Some(expected_type)), "{name}: {types:?}");
                 let before: Vec<_> = brep
                     .faces()
@@ -4653,7 +5105,7 @@ mod tests {
         let records = ffi::split_surface_records(&out).unwrap();
         for (arena, (block, records)) in [a, b.unwrap()].iter().zip(&records).enumerate() {
             for unowned in [false, true] {
-                let (mut brep, mut exact, types) = import_with_types(block).unwrap();
+                let (mut brep, mut exact, types) = import_raw_with_types(block).unwrap();
                 let faces: Vec<_> = brep.faces().ids().collect();
                 for &face_id in &faces {
                     let face = brep.face_mut(face_id).unwrap();
@@ -4700,7 +5152,7 @@ mod tests {
         let mut input = import_input("cone.smb");
         input.brep_a = fixture.clone();
         input.brep_b = Some(fixture);
-        let mut prepared = prepare(&input).unwrap();
+        let mut prepared = prepare(&input, false).unwrap();
         let k = Kernel::default();
         for (arena, tolerance) in [(0, 0.003), (1, 0.007)] {
             let handle = hd(arena, K_FACE_SURFACE, 0);
@@ -4739,7 +5191,7 @@ mod tests {
         let [records, _] = ffi::split_surface_records(&out).unwrap();
         let index = records.iter().position(Option::is_some).unwrap();
         for mutation in 0..5 {
-            let (mut brep, mut exact, mut types) = import_with_types(&a).unwrap();
+            let (mut brep, mut exact, mut types) = import_raw_with_types(&a).unwrap();
             let mut records = records.clone();
             match mutation {
                 0 => {
@@ -4761,7 +5213,7 @@ mod tests {
         for name in ["vase_rev.smb", "toruswvy.smb"] {
             let mut input = import_input(name);
             input.brep_b = None;
-            let prepared = prepare(&input).unwrap();
+            let prepared = prepare(&input, false).unwrap();
             let brep = prepared.two.breps[0].as_ref().unwrap();
             let faceuse = brep
                 .faceuses()
@@ -4775,10 +5227,427 @@ mod tests {
                 fu: h(0, K_FACEUSE, i64::from(faceuse.index())),
                 skip: false,
             }];
-            let rust = run_rust(&input).unwrap();
-            assert_eq!(rust.deferred.unwrap().unit, HANG_26);
+            assert!(run_rust(&input).is_err_and(|e| e.0.contains(HANG_26)));
             let cpp = run_cpp(&input).unwrap();
-            assert_eq!(cpp.values["state"], [0.0, 7.0, -6.0]);
+            assert!(cpp.rejected.unwrap().starts_with("HANG-26:"));
+            // the shim's own stop at the op, should the runner's guard miss it
+            let p = prepare(&input, false).unwrap();
+            let encoded = encode(&input, &p.hdr, &p.ops).unwrap();
+            let pa = path_of(Some(&input.brep_a)).unwrap();
+            let pb = path_of(None).unwrap();
+            let out = ffi::eval(Op::Run, [&pa, &pb], &encoded).unwrap();
+            assert_eq!(out, [0.0, 7.0, -6.0]);
         }
+    }
+
+    /// `gen0730`'s op script, as the generated input serialises it.
+    fn gen0730_ops(inputs: &Inputs) -> String {
+        serde_json::to_value(&inputs.ops)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .map_or_else(
+                || "<unserializable>".into(),
+                |ops| {
+                    ops.iter()
+                        .enumerate()
+                        .map(|(i, op)| {
+                            let name = op.get("op").and_then(Value::as_str).unwrap_or("?");
+                            format!("{i}:{name}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+            )
+    }
+
+    /// The state arrays around `center`, plus the full record when it is short enough
+    /// to keep the failure log readable.
+    fn gen0730_state_context(cpp: &Output, rust: &Output, center: usize) -> String {
+        use std::fmt::Write as _;
+
+        let cpp_state: &[f64] = cpp.values.get("state").map_or(&[], Vec::as_slice);
+        let rust_state: &[f64] = rust.values.get("state").map_or(&[], Vec::as_slice);
+        let mut out = format!(
+            "state lengths: cpp={} rust={}; index {center}\n",
+            cpp_state.len(),
+            rust_state.len()
+        );
+        for (side, values) in [("cpp", cpp_state), ("rust", rust_state)] {
+            let lo = center.saturating_sub(6);
+            let hi = (center + 7).min(values.len());
+            writeln!(
+                out,
+                "{side}.state[{lo}..{hi}]={:?}",
+                values.get(lo..hi).unwrap_or(&[])
+            )
+            .expect("write state diagnostic to String");
+        }
+        if cpp_state.len() <= 512 && rust_state.len() <= 512 {
+            writeln!(out, "cpp.state={cpp_state:?}\nrust.state={rust_state:?}")
+                .expect("write full state diagnostic to String");
+        }
+        out
+    }
+
+    // These probes execute fresh build/import and original prefixes, followed by
+    // the existing EdgeState query. They observe READBACK, not mutation events or
+    // internal opcode-12 checkpoints. Analytic UV lines are never sliced for replay.
+    mod gen0730_probes {
+        use super::*;
+        use solidcore::curve::curve::p2::LINE_TYPE;
+
+        struct LineSnapshot {
+            point: [f64; 3],
+            direction: [f64; 3],
+            domain: [f64; 2],
+            scale: f64,
+            inside_out: f64,
+        }
+
+        struct CurveSnapshot {
+            kind: f64,
+            dim: u64,
+            base: Option<CrvIn>,
+            line: Option<LineSnapshot>,
+            raw: Vec<f64>,
+        }
+
+        fn take<'a>(rest: &mut &'a [f64], count: usize) -> &'a [f64] {
+            assert!(count <= rest.len(), "truncated gen0730 probe record");
+            let (head, tail) = (*rest).split_at(count);
+            *rest = tail;
+            head
+        }
+
+        fn count(rest: &mut &[f64]) -> usize {
+            let n = take(rest, 1)[0];
+            assert!(n.is_finite() && (0.0..=65_536.0).contains(&n) && n.fract() == 0.0);
+            n as usize
+        }
+
+        fn curve_data(rest: &mut &[f64], dim: u64) -> CrvIn {
+            let (n, p, m) = (count(rest), count(rest), count(rest));
+            assert_eq!(m, n + p + 1);
+            let values = take(rest, 4 * (n + 1));
+            let (cpts, remainder) = values.as_chunks::<4>();
+            assert!(remainder.is_empty(), "partial control point in readback");
+            assert_eq!(cpts.len(), n + 1);
+            CrvIn {
+                dim,
+                cpts: cpts.to_vec(),
+                p,
+                u: take(rest, m + 1).to_vec(),
+            }
+        }
+
+        fn fixture_curve(rest: &mut &[f64]) -> Option<CurveSnapshot> {
+            let start = *rest;
+            let kind = take(rest, 1)[0];
+            if kind == -1.0 {
+                return None;
+            }
+            assert!(kind >= 0.0, "unsupported curve in prefix snapshot: {kind}");
+            let dim = count(rest) as u64;
+            let has_nurb = take(rest, 1)[0];
+            assert!(has_nurb == 0.0 || has_nurb == 1.0);
+            let base = (has_nurb == 1.0).then(|| curve_data(rest, dim));
+            let line = if kind == LINE_TYPE as f64 {
+                let data = take(rest, 10);
+                Some(LineSnapshot {
+                    point: [data[0], data[1], data[2]],
+                    direction: [data[3], data[4], data[5]],
+                    domain: [data[6], data[7]],
+                    scale: data[8],
+                    inside_out: data[9],
+                })
+            } else {
+                None
+            };
+            Some(CurveSnapshot {
+                kind,
+                dim,
+                base,
+                line,
+                raw: start[..start.len() - rest.len()].to_vec(),
+            })
+        }
+
+        fn selected_uv(state: &[f64], slot: usize, expected_eus: usize) -> CurveSnapshot {
+            let mut rest = state;
+            let _ = fixture_curve(&mut rest); // Edge curve, not the selected UV curve.
+            take(&mut rest, 3); // Edge interval and tolerance.
+            if take(&mut rest, 1)[0] == 1.0 {
+                take(&mut rest, 3);
+                if take(&mut rest, 1)[0] == 1.0 {
+                    take(&mut rest, 3);
+                }
+            }
+            let n_eus = count(&mut rest);
+            assert_eq!(n_eus, expected_eus);
+            let mut selected = None;
+            for i in 0..n_eus {
+                let curve = fixture_curve(&mut rest);
+                if i == slot {
+                    selected = curve;
+                }
+            }
+            assert!(rest.is_empty(), "unconsumed prefix edge-state fields");
+            let curve = selected.expect("selected edgeuse has no UV curve");
+            assert_eq!(curve.dim, 2);
+            curve
+        }
+
+        fn clamped_interval(curve: &CrvIn) -> Extent1d {
+            assert!(curve.p < curve.cpts.len());
+            assert_eq!(curve.u.len(), curve.cpts.len() + curve.p + 1);
+            let lo = *curve.u.first().expect("UV curve has no knots");
+            let hi = *curve.u.last().expect("UV curve has no knots");
+            assert_eq!(curve.u.get(curve.p), Some(&lo));
+            assert_eq!(curve.u.get(curve.cpts.len()), Some(&hi));
+            assert!(curve.u.iter().take(curve.p + 1).all(|u| *u == lo));
+            assert!(curve.u.iter().rev().take(curve.p + 1).all(|u| *u == hi));
+            assert!(lo < hi);
+            Extent1d::from_min_max(lo, hi)
+        }
+
+        fn describe_curve(side: &str, curve: &CurveSnapshot) {
+            eprintln!(
+                "{side} selected UV kind={} dim={} base_nurb={:?}",
+                curve.kind, curve.dim, curve.base
+            );
+            if let Some(base) = &curve.base {
+                let interval = clamped_interval(base);
+                eprintln!(
+                    "{side} base NURB clamped interval=[{}, {}]",
+                    interval.min(),
+                    interval.max()
+                );
+            }
+            if let Some(line) = &curve.line {
+                eprintln!("{side} analytic LINE point={:?} direction={:?} domain={:?} scale={:?} inside_out={:?}",
+                    line.point, line.direction, line.domain, line.scale, line.inside_out);
+            }
+        }
+
+        fn compare_stage(stage: &str, cpp: &[f64], rust: &[f64]) -> bool {
+            let diff = compare(
+                &Output::new().values("raw", cpp.to_vec()),
+                &Output::new().values("raw", rust.to_vec()),
+                &[],
+            );
+            eprintln!("{stage}\ncpp={cpp:?}\nrust={rust:?}\nstrict_diff={diff:#?}");
+            diff.pass()
+        }
+
+        fn script_state(output: &Output) -> &[f64] {
+            assert!(
+                output.rejected.is_none() && output.deferred.is_none() && output.error.is_none()
+            );
+            output.values.get("state").expect("missing script state")
+        }
+
+        fn query_tail<'a>(queried: &'a Output, baseline: &Output) -> &'a [f64] {
+            let state = script_state(queried);
+            let before_query = script_state(baseline);
+            assert!(state.len() >= before_query.len() + 2);
+            let (prefix, query) = state.split_at(before_query.len());
+            assert!(
+                prefix
+                    .iter()
+                    .zip(before_query)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "query run's prefix differs from the matching no-query run"
+            );
+            assert_eq!(&query[..2], &[17.0, 0.0]);
+            &query[2..]
+        }
+
+        #[test]
+        fn fresh_import_and_original_prefix_line_readbacks() {
+            let seed = CaseContext::seed_for("offset.offset_geometry_creation", 730);
+            assert_eq!(seed, 9_515_163_603_058_763_486);
+            let generated = generate(&mut Rng::new(seed)).expect("gen0730 generator");
+            assert_eq!(generated["brep_a"]["file"], "cone.smb");
+            let input: Inputs = serde_json::from_value(generated.clone()).expect("gen0730 input");
+            assert_eq!(input.ops.len(), 7);
+            eprintln!("gen0730 seed={seed} original_input={generated}");
+            eprintln!("READBACK includes build/import, appended-query cache/executive preparation, getters and serialization; it is not a mutation-writer trace");
+            let prepared = prepare(&input, false).expect("prepare gen0730 handles");
+            let OpIn::ExtendTrimEdges {
+                eu, off, other_off, ..
+            } = prepared.ops[6].op
+            else {
+                panic!("gen0730 op 6 must be opcode 12");
+            };
+            assert!(
+                triple_to_h(other_off).is_none(),
+                "radial UV selection is not covered"
+            );
+            let eu = triple_to_h(eu).expect("base edgeuse");
+            let off = triple_to_h(off).expect("offset edgeuse");
+            let edge = prepared.two.edgeuse_edge(eu).unwrap().unwrap();
+            let eus = prepared.two.edge_edgeuses(edge).unwrap();
+            let slot = eus
+                .iter()
+                .position(|x| *x == eu)
+                .expect("selected edgeuse slot");
+            assert_eq!((eu.b, eu.kind, eu.i), (0, K_EDGEUSE, 5));
+            assert_eq!((edge.b, edge.kind, edge.i), (0, K_EDGE, 1));
+            assert_eq!(slot, 1);
+            let off_face = prepared.two.edgeuse_face(off).unwrap().unwrap();
+            let OpIn::UpdateFaceDomain { f, s } = prepared.ops[5].op else {
+                panic!("gen0730 op 5 must report the selected surface domain");
+            };
+            assert_eq!(triple_to_h(f), Some(off_face));
+            assert_eq!(triple_to_h(s), prepared.two.face_surface(off_face).unwrap());
+
+            eprintln!("Resolved eu={eu:?}, edge={edge:?}, serialized_uv_slot={slot}");
+            let mut all_readbacks_match = true;
+            let mut first_record_readback = None;
+            let mut first_selected_readback = None;
+            // Seven independent checkpoints: fresh import, then original ops 0..0
+            // through 0..5. No new op is inserted into the original full case.
+            for prefix_len in 0..input.ops.len() {
+                let mut baseline = input.clone();
+                baseline.ops.truncate(prefix_len);
+                let label = if prefix_len == 0 {
+                    "fresh import/cache preparation READBACK".to_owned()
+                } else {
+                    format!(
+                        "original prefix ops 0..={} READBACK ({})",
+                        prefix_len - 1,
+                        gen0730_ops(&baseline)
+                    )
+                };
+                eprintln!("CHECKPOINT {label}");
+                let cpp_baseline = run_cpp(&baseline).expect("native no-query prefix");
+                let rust_baseline = run_rust(&baseline).expect("Rust no-query prefix");
+                let baseline_matches = compare_stage(
+                    &format!("{label} complete no-query records"),
+                    script_state(&cpp_baseline),
+                    script_state(&rust_baseline),
+                );
+
+                let mut queried = baseline.clone();
+                queried.ops.push(OpIn::EdgeState {
+                    e: [i64::from(edge.b), i64::from(edge.kind), i64::from(edge.i)],
+                });
+                let cpp_query = run_cpp(&queried).expect("native EdgeState readback");
+                let rust_query = run_rust(&queried).expect("Rust EdgeState readback");
+                let records_match = compare_stage(
+                    &format!("{label} complete queried records"),
+                    script_state(&cpp_query),
+                    script_state(&rust_query),
+                );
+                let cpp_uv = selected_uv(query_tail(&cpp_query, &cpp_baseline), slot, eus.len());
+                let rust_uv = selected_uv(query_tail(&rust_query, &rust_baseline), slot, eus.len());
+                eprintln!(
+                    "Query tail offsets: cpp={} rust={}",
+                    script_state(&cpp_baseline).len(),
+                    script_state(&rust_baseline).len()
+                );
+                describe_curve("cpp", &cpp_uv);
+                describe_curve("rust", &rust_uv);
+                let selected_matches = compare_stage(
+                    &format!("{label} complete selected-UV record"),
+                    &cpp_uv.raw,
+                    &rust_uv.raw,
+                );
+                if (!baseline_matches || !records_match) && first_record_readback.is_none() {
+                    first_record_readback = Some(label.clone());
+                }
+                if !selected_matches && first_selected_readback.is_none() {
+                    first_selected_readback = Some(label);
+                }
+                all_readbacks_match &= baseline_matches && records_match && selected_matches;
+            }
+            eprintln!("Earliest differing complete-record READBACK={first_record_readback:?}; selected-UV READBACK={first_selected_readback:?}; neither identifies a mutation writer");
+            eprintln!("UNOBSERVED: UV extension/knot-removal/domain-selection/trim replays omitted for this Line-native diagnostic; no Line-to-BSpline slicing and no replay PASS count");
+            eprintln!("UNOBSERVED: opcode-12 internal checkpoints and final TrimExtendedEdge selected interval; no SmCircle slicing/replay");
+
+            // Also retain the original failure in this diagnostic test so Cargo's
+            // failure log exposes all prefix readbacks even when no replay runs.
+            // The separate durable full regression below is unchanged.
+            let cpp_full = run_cpp(&input).expect("original native run");
+            let rust_full = run_rust(&input).expect("original Rust run");
+            assert_eq!(script_state(&cpp_full).len(), 186);
+            assert_eq!(script_state(&rust_full).len(), 186);
+            let full_diff = compare(&cpp_full, &rust_full, &[]);
+            assert!(
+                all_readbacks_match && full_diff.pass(),
+                "original gen0730 remains subject to strict parity: {full_diff:#?}\n{}",
+                gen0730_state_context(&cpp_full, &rust_full, 87)
+            );
+        }
+    }
+
+    /// Durable replay of generated case 730 (seed `9515163603058763486`), the case
+    /// that first reaches the offset trim/extend mismatch once the face-tolerance
+    /// metadata is preserved. It compares the complete C++ and Rust output with the
+    /// runner's unchanged 1e-9 relative rule and, on failure, prints the exact
+    /// generated input, its op script and the state record around index 87.
+    #[test]
+    fn gen0730_replays_index_730_and_compares_cpp_rust_state() {
+        const UNIT: &str = "offset.offset_geometry_creation";
+        const INDEX: usize = 730;
+        const STATE_INDEX: usize = 87;
+
+        let seed = CaseContext::seed_for(UNIT, INDEX);
+        assert_eq!(
+            seed, 9_515_163_603_058_763_486,
+            "gen0730 seed/unit/index changed; the regression must replay the recorded case"
+        );
+        let mut rng = Rng::new(seed);
+        let generated = generate(&mut rng).expect("gen0730 generator returned None");
+        let inputs: Inputs =
+            serde_json::from_value(generated.clone()).expect("deserialize gen0730 input");
+        let input_json = serde_json::to_string(&generated).expect("serialize gen0730 input");
+        let case = Case {
+            unit: UNIT.into(),
+            name: format!("gen{INDEX:04}"),
+            source: CaseSource::Generated { seed },
+            inputs: generated,
+        };
+        assert_eq!(case.name, "gen0730");
+
+        let runner = Runner;
+        let cpp = runner
+            .run_cpp(&case)
+            .unwrap_or_else(|e| panic!("gen0730 C++ harness error: {e}\ninput={input_json}"));
+        let rust = runner
+            .run_rust(&case)
+            .unwrap_or_else(|e| panic!("gen0730 Rust harness error: {e}\ninput={input_json}"));
+        let context = || {
+            format!(
+                "gen0730 seed={seed} ops={}\ninput={}\n{}",
+                gen0730_ops(&inputs),
+                input_json,
+                gen0730_state_context(&cpp, &rust, STATE_INDEX)
+            )
+        };
+
+        assert!(cpp.rejected.is_none(), "C++ rejected gen0730\n{}", context());
+        assert!(rust.rejected.is_none(), "Rust rejected gen0730\n{}", context());
+        assert!(cpp.deferred.is_none(), "C++ deferred gen0730\n{}", context());
+        assert!(rust.deferred.is_none(), "Rust deferred gen0730\n{}", context());
+        assert!(cpp.error.is_none(), "C++ errored on gen0730\n{}", context());
+        assert!(rust.error.is_none(), "Rust errored on gen0730\n{}", context());
+
+        let diff = compare(&cpp, &rust, &[]);
+        assert!(
+            diff.pass(),
+            "gen0730 mismatch (strict 1e-9 relative rule)\n{diff:#?}\n{}",
+            context()
+        );
+        assert!(
+            diff.values_compared > 0,
+            "gen0730 compared no values\n{}",
+            context()
+        );
+        assert!(
+            diff.nonzero_compared > 0,
+            "gen0730 compared only zeros\n{}",
+            context()
+        );
     }
 }
