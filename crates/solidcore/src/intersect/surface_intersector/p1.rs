@@ -608,6 +608,16 @@ pub struct SurfaceIntersector<'s> {
     pub doing_extension_clipping: bool,
     /// `m_bCurveIsClosed`.
     pub curve_is_closed: bool,
+    /// Not upstream: the `trace_step` calls left to the start-point loop of
+    /// `DoIntersection` (`u64::MAX` outside it: no bound); see
+    /// [`MAX_START_LOOP_TRACE_STEPS`](super::p4::MAX_START_LOOP_TRACE_STEPS).
+    pub trace_steps_left: u64,
+    /// Not upstream: the bound `set_trace_budget` starts a start-point loop with,
+    /// [`MAX_START_LOOP_TRACE_STEPS`](super::p4::MAX_START_LOOP_TRACE_STEPS) (lowered by
+    /// tests only).
+    pub(crate) start_loop_trace_steps: u64,
+    /// Not upstream: a `trace_step` call was refused because `trace_steps_left` ran out.
+    pub trace_budget_refused: bool,
     /// `m_bCheckForInteriorCurves` (no longer used upstream).
     pub check_for_interior_curves: bool,
     /// `m_bDoingSelfIntersection`: both surfaces are the same object.
@@ -634,6 +644,9 @@ pub struct SurfaceIntersector<'s> {
     pub(crate) singular_start_inside_direction: bool,
     /// Status policy captured from the constructing kernel (#483).
     pub(crate) alignment_statuses: bool,
+    /// `Kernel::fixes.brep_edit_statuses_pass_on` captured from the constructing kernel
+    /// (WR-658; fork e7ebc8d's `SmAdvSurfaceIntersector` statuses).
+    pub(crate) edit_statuses: bool,
     /// The object is an `SmAdvSurfaceIntersector`: the virtual
     /// `ComputeSingularityPoint` that `ComputePointValues` calls is that class's
     /// override, not the basic `SM_ERR` one.
@@ -730,6 +743,9 @@ impl<'s> SurfaceIntersector<'s> {
             extension_distance: 0.0,
             doing_extension_clipping: false,
             curve_is_closed: false,
+            trace_steps_left: u64::MAX,
+            start_loop_trace_steps: super::p4::MAX_START_LOOP_TRACE_STEPS,
+            trace_budget_refused: false,
             check_for_interior_curves: true,
             doing_self_intersection: core::ptr::eq(surface1, surface2),
             clipped_by_through_point: false,
@@ -742,6 +758,7 @@ impl<'s> SurfaceIntersector<'s> {
             through_points: Vec::new(),
             singular_start_inside_direction: k.fixes.ssi_singular_start_inside_direction,
             alignment_statuses: k.fixes.ssi_alignment_statuses,
+            edit_statuses: k.fixes.brep_edit_statuses_pass_on,
             advanced: false,
         })
     }
